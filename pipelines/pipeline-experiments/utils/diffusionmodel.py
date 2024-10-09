@@ -15,7 +15,7 @@ from transformers import AutoTokenizer, T5EncoderModel
 
 from .RectifiedFlow import RectifiedFlow
 from .dit import DiT
-from .CaT import CrossAttentionTransformer  # Assuming we'll create this later
+from .CaT import CrossAttentionTransformer 
 
 class DiffusionModelPipeline:
     def __init__(self,
