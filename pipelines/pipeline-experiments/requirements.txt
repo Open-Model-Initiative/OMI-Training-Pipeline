@@ -1,6 +1,7 @@
 accelerate==0.34.2
 datasets==3.0.1
 diffusers=0.30.3
+tensorboard==2.18.0
 torch==2.4.1+cu124 --find-links https://download.pytorch.org/whl/cu124
 torchvision==0.19.1+cu124 --find-links https://download.pytorch.org/whl/cu124
 transformers==4.45.1

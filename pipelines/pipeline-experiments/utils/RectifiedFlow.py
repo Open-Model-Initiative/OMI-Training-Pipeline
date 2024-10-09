@@ -43,11 +43,11 @@ class RectifiedFlow():
         else:
             condition = torch.cat([t, condition], dim = 1)
             
-        if torch.is_inference_mode_enabled():
-            vPred=self.emaModel(xT,condition)
+        if not self.model.training:
+            vPred = self.emaModel(xT, condition)
         else:
-            vPred=self.model(xT,condition)
-            
+            vPred = self.model(xT, condition)
+  
         return vPred
 
     def call(self,steps,shape=None, condition=None, loopFunction=None):
