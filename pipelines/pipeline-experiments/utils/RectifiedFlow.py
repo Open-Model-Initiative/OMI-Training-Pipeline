@@ -4,8 +4,10 @@ from tqdm.auto import tqdm
 class RectifiedFlow():
     def __init__(self,model,T,lr=3e-4,device='cpu',optimizer=None,emaStrength=0.0):
         self.model=model
-        if emaStrength>0.0:
-            self.emaModel=torch.optim.swa_utils.AveragedModel(self.model, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(emaStrength))
+        self.emaStrength=emaStrength
+        if self.emaStrength>0.0:
+            self.emaModel = torch.optim.swa_utils.AveragedModel(self.model,
+                                                                multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(self.emaStrength))
         else:
             self.emaModel=self.model
 

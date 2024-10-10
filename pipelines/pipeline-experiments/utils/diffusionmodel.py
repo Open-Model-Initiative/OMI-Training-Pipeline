@@ -6,16 +6,16 @@ import diffusers
 import transformers 
 
 import numpy as np
-from torch import nn
 from PIL import Image
 from tqdm import tqdm
 from diffusers import AutoencoderKL
 from torch.utils.tensorboard import SummaryWriter
+from safetensors.torch import load_file,save_file
 from transformers import AutoTokenizer, T5EncoderModel
 
-from .RectifiedFlow import RectifiedFlow
 from .dit import DiT
-from .CaT import CrossAttentionTransformer 
+from .CaT import CrossAttentionTransformer
+from .RectifiedFlow import RectifiedFlow
 
 class DiffusionModelPipeline:
     def __init__(self,
@@ -26,17 +26,20 @@ class DiffusionModelPipeline:
                  cat_params = None,
                  max_length: int = 128,
                  num_train_timesteps=1000,
+                 emaStrength = 0.0,
                  optimizer = None,
                  global_step = 0,
                  device='cuda'):
         
         self.device = torch.device(device)
+        self.emaStrength = emaStrength
         
         # Initialize components
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained('components/t5Base')
-        self.text_encoder = text_encoder or T5EncoderModel.from_pretrained('components/t5Base').to(device)
-        self.vae = vae or AutoencoderKL.from_pretrained('components/flux_schnell_vae').to(device)
+        self.text_encoder = text_encoder or T5EncoderModel.from_pretrained('components/t5Base').to(self.device)
+        self.vae = vae or AutoencoderKL.from_pretrained('components/flux_schnell_vae').to(self.device)
         self.latent_channels = self.vae.decoder.conv_in.in_channels
+        
         # Freeze text_encoder and VAE
         for param in self.text_encoder.parameters():
             param.requires_grad = False
@@ -62,17 +65,18 @@ class DiffusionModelPipeline:
                
         self.dit_params['conditionC'] = 1 + self.cat_params['output_dim']  # time + CaT output
         
-        self.dit = DiT(channels=self.dit_params['channels'],
-                       nBlocks=self.dit_params['nBlocks'],
-                       inC=self.dit_params['inC'], 
-                       outC=self.latent_channels, 
-                       conditionC=self.dit_params['conditionC'], 
-                       nHeads=self.dit_params['nHeads'], 
-                       patchSize=self.dit_params['patchSize']
-                       ).to(device)
-
-        self.cat = CrossAttentionTransformer(**self.cat_params).to(device)
-        self.diffusion_model = RectifiedFlow(self.dit, num_train_timesteps, device = device)
+        self.cat = CrossAttentionTransformer(**self.cat_params).to(self.device)
+        self.diffusion_model = RectifiedFlow(
+            DiT(channels=self.dit_params['channels'],
+                nBlocks=self.dit_params['nBlocks'],
+                inC=self.dit_params['inC'], 
+                outC=self.latent_channels, 
+                conditionC=self.dit_params['conditionC'], 
+                nHeads=self.dit_params['nHeads'], 
+                patchSize=self.dit_params['patchSize']).to(self.device),
+            num_train_timesteps,
+            emaStrength= self.emaStrength,
+            device = self.device)
         
         self._name_or_path = "./"
         self.max_length = max_length
@@ -84,13 +88,12 @@ class DiffusionModelPipeline:
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         # Load config
         config_path = os.path.join(pretrained_model_name_or_path, "config.json")
-        with open(config_path, "r") as f:
-            config = json.load(f)
-
+        config = json.load(open(config_path))
+        
         # Load components
-        tokenizer = AutoTokenizer.from_pretrained(config["text_encoder_name"])
-        text_encoder = T5EncoderModel.from_pretrained(config["text_encoder_name"])
-        vae = AutoencoderKL.from_pretrained(config["vae_name"])
+        tokenizer = AutoTokenizer.from_pretrained(os.path.join(pretrained_model_name_or_path, config["tokenizer"]))
+        text_encoder = T5EncoderModel.from_pretrained(os.path.join(pretrained_model_name_or_path,config["text_encoder"]))
+        vae = AutoencoderKL.from_pretrained(os.path.join(pretrained_model_name_or_path,config["vae"]))
         
         # Create model
         model = cls(
@@ -99,40 +102,79 @@ class DiffusionModelPipeline:
             vae=vae,
             dit_params=config["dit_params"],
             cat_params=config["cat_params"],
-            num_train_timesteps=config["num_train_timesteps"]
+            num_train_timesteps=config["num_train_timesteps"],
+            max_length=config["max_length"],
+            emaStrength=config["emaStrength"],
         )
 
-        # Load state dict
-        state_dict = torch.load(os.path.join(pretrained_model_name_or_path, "model.pth"))
-        model.load_state_dict(state_dict)
-
-        model._name_or_path = pretrained_model_name_or_path
+        # Load DiT model
+        dit_load_path = os.path.join(pretrained_model_name_or_path, 'dit.safetensors')
+        dit_state_dict = load_file(dit_load_path)
+        model.diffusion_model.model.load_state_dict(dit_state_dict)
+        
+        # Load EMA model if it exists
+        ema_load_path = os.path.join(pretrained_model_name_or_path, 'ema.safetensors')
+        if os.path.exists(ema_load_path):
+            ema_state_dict = load_file(ema_load_path)
+            # Initialize emaModel in RectifiedFlow
+            model.diffusion_model.emaModel = torch.optim.swa_utils.AveragedModel(
+                model.diffusion_model.model,
+                avg_fn=model.diffusion_model.ema_avg_fn(config['emaStrength'])
+            )
+            model.diffusion_model.emaModel.load_state_dict(ema_state_dict)
+        else:
+            # If no EMA model saved, set emaModel to model
+            model.diffusion_model.emaModel = model.diffusion_model.model
+        
+        #load CaT
+        cat_load_path = os.path.join(pretrained_model_name_or_path, 'cat.safetensors')
+        cat_state_dict = load_file(cat_load_path)
+        model.cat.load_state_dict(cat_state_dict)
+        
         return model
 
     def save_pretrained(self, save_directory):
         os.makedirs(save_directory, exist_ok=True)
-
+        
+        ##Save the DiT
+        dit_save_path = os.path.join(save_directory, "dit.safetensors")
+        dit_state_dict = self.diffusion_model.model.state_dict()
+        save_file(dit_state_dict, dit_save_path)
+        
+        ##If Ema model is not the same as the DiT, save the ema model
+        if self.diffusion_model.emaModel is not self.diffusion_model.model:
+            ema_save_path = os.path.join(save_directory, "ema_model.safetensors")
+            ema_state_dict = self.diffusion_model.emaModel.state_dict()
+            save_file(ema_state_dict, ema_save_path)
+        
+        #Save the CaT
+        cat_save_path = os.path.join(save_directory, "cat.safetensors")
+        cat_state_dict = self.cat.state_dict()
+        save_file(cat_state_dict, cat_save_path)
+        
+        ##Save the vae
+        vae_save_path = os.path.join(save_directory, "vae")
+        self.vae.save_pretrained(vae_save_path)
+        
+        # Save tokenizer
+        self.tokenizer.save_pretrained(os.path.join(save_directory, self.tokenizer.name_or_path))
+        self.text_encoder.save_pretrained(os.path.join(save_directory, self.text_encoder.config.name_or_path))
+        
         # Save config
         config = {
-            "text_encoder_name": self.text_encoder.config.name_or_path,
-            "vae_name": self.vae.config.name_or_path,
+            "tokenizer": self.text_encoder.config.name_or_path,
+            "text_encoder": self.text_encoder.config.name_or_path,
+            "vae": 'vae',
+            "max_length": self.max_length,
+            "emaStrength": self.diffusion_model.emaStrength,
             "dit_params": self.dit_params,
             "cat_params": self.cat_params,
             "num_train_timesteps": self.diffusion_model.T,
+            "time_of_save": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         with open(os.path.join(save_directory, "config.json"), "w") as f:
             json.dump(config, f)
 
-        # Save model state
-        torch.save(self.state_dict(), os.path.join(save_directory, "model.pth"))
-
-        # Save individual components
-        self.tokenizer.save_pretrained(os.path.join(save_directory, "tokenizer"))
-        self.text_encoder.save_pretrained(os.path.join(save_directory, "text_encoder"))
-        self.vae.save_pretrained(os.path.join(save_directory, "vae"))
-
-        self._name_or_path = save_directory
-        
     def encode_text(self, text):
         tokens = self.tokenizer(text, padding=True, max_length= self.max_length, truncation=True, return_tensors="pt").to(self.device)
         with torch.no_grad():
@@ -141,14 +183,14 @@ class DiffusionModelPipeline:
 
     def encode_image(self, image):
         with torch.no_grad():
-            latent = self.vae.encode(image).latent_dist.sample()
+            latent = self.vae.encode(image).latent_dist.sample() - self.vae.config.shift_factor
             latent = latent * self.vae.config.scaling_factor
         return latent
 
     def decode_latents(self, latents):
         with torch.no_grad():
-            latents = 1 / self.vae.config.scaling_factor * latents
-            image = self.vae.decode(latents).sample
+            latents = (latents) / self.vae.config.scaling_factor + self.vae.config.shift_factor
+            image = self.vae.decode(latents)[0]
         return image
     
     def train_step(self,
@@ -166,10 +208,9 @@ class DiffusionModelPipeline:
                             leave=False)
         
         for step, batch in enumerate(progress_bar):
-            images, prompts = batch
+            images, prompts = batch[1]
             images = images.to(self.device)
             batch_size = images.size(0)
-            images = images.float() / 127.5 - 1.0
             
             ##Get into the latent space
             latents = self.encode_image(images)
@@ -186,7 +227,8 @@ class DiffusionModelPipeline:
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
-            self.diffusion_model.emaModel.update_parameters(self.diffusion_model.model)
+            if self.diffusion_model.emaModel is not self.diffusion_model.model: 
+                self.diffusion_model.emaModel.update_parameters(self.diffusion_model.model)
             
             epoch_loss += loss.item()
             
@@ -195,7 +237,7 @@ class DiffusionModelPipeline:
             if logger is not None and (self.global_step% log_interval == 0):
                 logger.add_scalar('training loss:', loss.item(), self.global_step)
             
-            progress_bar.set_description(f"Epoch {epoch + 1} - Step {self.global_step} - Loss: {epoch_loss / (step + 1):.4f}")
+            progress_bar.set_description(f"Epoch {epoch + 1} - Step {self.global_step} - Loss: {epoch_loss / (step + 1):.6f}")
                 
                 
         return epoch_loss
@@ -213,11 +255,10 @@ class DiffusionModelPipeline:
                             leave=False)
 
         with torch.no_grad():
-            for _, batch in progress_bar:
-                images, prompts = batch
+            for _, batch in enumerate(progress_bar):
+                images, prompts = batch[1]
                 images = images.to(self.device)
                 batch_size = images.size(0)
-                images = images.float() / 127.5 - 1.0
 
                 latents = self.encode_image(images)
                 text_embeds = self.encode_text(list(prompts))
@@ -241,12 +282,18 @@ class DiffusionModelPipeline:
               lr: float = 1e-4,
               log_interval: int = 100,
               save_interval: int = 1,
-              output_dir: str = './checkpoints'):
+              output_dir: str = './checkpoints',
+              patience: int = 5):
         
-        train_loss = {}
-        val_loss = {}
+        train_loss_history = []
+        val_loss_history = []
         
-        log_dir = os.path.join(output_dir, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        #Early stopping variables
+        best_loss = float('inf')
+        epochs_no_improve = 0
+        
+        #Save/Logging Variables
+        log_dir = os.path.join(output_dir)
         logger = SummaryWriter(log_dir)
 
         if self.optimizer is None:
@@ -265,41 +312,69 @@ class DiffusionModelPipeline:
             self.diffusion_model.emaModel.train()
             self.cat.train()
             
-            train_loss[epoch] = self.train_step(train_dataloader, 
+            epoch_train_loss = self.train_step(train_dataloader, 
                                          epoch, 
                                          logger, 
                                          log_interval)
             ##Validation Phase
+            train_loss_history.append(epoch_train_loss)
+            
             if val_dataloader is not None:
                 self.diffusion_model.model.eval()
                 self.diffusion_model.emaModel.eval()
                 self.cat.eval()
                 
-                val_loss[epoch] = self.validation_step(val_dataloader, 
+                epoch_val_loss = self.validation_step(val_dataloader, 
                                                        epoch, 
                                                        logger)
-
+                
+                val_loss_history.append(epoch_val_loss)
+            
+            current_loss = epoch_train_loss
+            
+            #Check for improvement
+            improvement = round(best_loss - current_loss, 6)
+            if improvement > 0:
+                best_loss = current_loss
+                epochs_no_improve = 0
+            
+                best_model_dir = os.path.join(output_dir, 'best_model')
+                self.save_pretrained(best_model_dir)
+                logger.add_text("Training Info", f"Epoch {epoch + 1} - Model improved. Saving model to {best_model_dir}")
+            else:
+                epochs_no_improve += 1
+                logger.add_text("Training Info", f"Epoch {epoch + 1} - Model did not improve {epochs_no_improve} times")
+            
+            if epochs_no_improve >= patience:
+                logger.add_text("Training Info", f"Early stopping at epoch {epoch + 1}")
+                checkpoint_dir = os.path.join(log_dir, f"epoch_{epoch + 1}")
+                self.save_pretrained(checkpoint_dir)
+                logger.add_text("Training Info", f"Epoch {epoch + 1} - Final Model saved to {checkpoint_dir}")
+                break
                         
             if (epoch + 1) % save_interval == 0:
-                self.save_pretrained(log_dir, exists_ok= True)
+                checkpoint_dir = os.path.join(log_dir, f"epoch_{epoch + 1}")
+                self.save_pretrained(checkpoint_dir)
+                logger.add_text("Training Info", f"Epoch {epoch + 1} - Model saved to {checkpoint_dir}")
+                
         
         logger.close()
-        return train_loss, val_loss
+        return {"training_loss": train_loss_history, 
+                "validation_loss": val_loss_history}
 
     def to(self, device):
         self.device = torch.device(device)
         self.text_encoder = self.text_encoder.to(self.device)
         self.vae = self.vae.to(self.device)
-        self.dit = self.dit.to(self.device)
         self.cat = self.cat.to(self.device)
         self.diffusion_model = self.diffusion_model.to(self.device)
-        return super().to(self.device)
+        return self
 
     def generate(self, prompt, num_inference_steps=50):
         self.vae.eval()
         self.text_encoder.eval()
         self.cat.eval()
-        self.dit.eval()
+        self.diffusion_model.model.eval()
         
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -345,7 +420,6 @@ class DiffusionModelPipeline:
             },
             "diffusion_model": {
                 "Rectified Flow": self.diffusion_model.__class__.__name__,
-                "Diffusion Transformer": self.dit.__class__.__name__,
             },
             "cross_attention_transformer": {
                 "CrossAttentionTransformer": self.cat.__class__.__name__,
