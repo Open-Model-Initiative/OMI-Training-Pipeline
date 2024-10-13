@@ -8,6 +8,8 @@ import transformers
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from torchvision import transforms
 from diffusers import AutoencoderKL
 from torch.utils.tensorboard import SummaryWriter
 from safetensors.torch import load_file,save_file
@@ -275,6 +277,55 @@ class DiffusionModelPipeline:
         
         return avg_val_loss
     
+    def visualize_training(self,
+                           visualize_prompt:str = "",
+                           num_inference_steps: int = 50,
+                           epoch: int = None,
+                           train_loss_history: list = None,
+                           val_loss_history: list = None,
+                           logger = None,
+                           output_dir = './checkpoints'):
+        # Ensure epoch is provided
+        if epoch is None:
+            raise ValueError("Epoch number must be provided for visualization.")
+
+        with torch.no_grad():
+            images = self.generate(visualize_prompt,
+                              num_inference_steps)
+        
+        # Convert images to tensors
+        image_tensor = torch.stack([transforms.ToTensor()(image) for image in images])
+
+        # Add images to logger
+        if logger is not None:
+            logger.add_images("Generated Images", image_tensor, global_step=self.global_step)
+            
+        
+        # Save images to disk
+        for idx, image in enumerate(images):
+            image_filename = f"prompt_{visualize_prompt[idx]}_epoch_{epoch+1}_step_{self.global_step}.png"
+            image_save_path = os.path.join(output_dir, image_filename)
+            image.save(image_save_path)
+                
+        epochs = list(range(len(train_loss_history)))
+        plt.figure()
+        plt.plot(epochs, train_loss_history, label = "Training Loss")
+        
+        if val_loss_history is not None and len(val_loss_history) > 0:
+            plt.plot(epochs, val_loss_history, label = "Validation Loss")
+        
+        plt.xlabel("Epochs")
+        plt.ylabel("Loss")
+        plt.title("Training and Validation Loss")
+        plt.legend()
+        
+        plt.savefig(os.path.join(output_dir, f"epoch_{epoch+1}__step_{self.global_step}_loss_plot.png"))
+        
+        if logger is not None:
+            logger.add_figure("Loss Plot", plt.gcf(), global_step = self.global_step)
+        
+        plt.close()
+        
     def train(self,
               train_dataloader,
               val_dataloader = None,
@@ -283,7 +334,10 @@ class DiffusionModelPipeline:
               log_interval: int = 100,
               save_interval: int = 1,
               output_dir: str = './checkpoints',
-              patience: int = 5):
+              patience: int = 5,
+              visualize: bool = False, 
+              visualize_interval = 50,
+              **kwargs):
         
         train_loss_history = []
         val_loss_history = []
@@ -341,6 +395,7 @@ class DiffusionModelPipeline:
                 best_model_dir = os.path.join(output_dir, 'best_model')
                 self.save_pretrained(best_model_dir)
                 logger.add_text("Training Info", f"Epoch {epoch + 1} - Model improved. Saving model to {best_model_dir}")
+                #Purposely not saving images here, as this should ramp down a ton in the beginning  
             else:
                 epochs_no_improve += 1
                 logger.add_text("Training Info", f"Epoch {epoch + 1} - Model did not improve {epochs_no_improve} times")
@@ -350,13 +405,29 @@ class DiffusionModelPipeline:
                 checkpoint_dir = os.path.join(log_dir, f"epoch_{epoch + 1}")
                 self.save_pretrained(checkpoint_dir)
                 logger.add_text("Training Info", f"Epoch {epoch + 1} - Final Model saved to {checkpoint_dir}")
+                if visualize:
+                    self.visualize_training(visualize_prompt = kwargs.get('visualize_prompt', ""), 
+                                            num_inference_steps = kwargs.get('num_inference_steps', 50),
+                                            epoch = epoch, 
+                                            train_loss_history = train_loss_history,
+                                            val_loss_history = val_loss_history,
+                                            logger = logger,
+                                            output_dir = output_dir)               
                 break
                         
             if (epoch + 1) % save_interval == 0:
+
                 checkpoint_dir = os.path.join(log_dir, f"epoch_{epoch + 1}")
                 self.save_pretrained(checkpoint_dir)
                 logger.add_text("Training Info", f"Epoch {epoch + 1} - Model saved to {checkpoint_dir}")
-                
+            if visualize and (epoch + 1) % visualize_interval == 0:
+                self.visualize_training(visualize_prompt = kwargs.get('visualize_prompt', ""), 
+                                        num_inference_steps = kwargs.get('num_inference_steps', 50),
+                                        epoch = epoch, 
+                                        train_loss_history = train_loss_history,
+                                        val_loss_history = val_loss_history,
+                                        logger = logger,
+                                        output_dir = output_dir)                
         
         logger.close()
         return {"training_loss": train_loss_history, 
@@ -386,7 +457,11 @@ class DiffusionModelPipeline:
         
         latents = self.diffusion_model.call(
             condition = text_embeddings, 
-            shape = (batch_size, self.latent_channels, 64, 64),
+            shape = (batch_size, self.latent_channels, 16, 16),
+            #128, 128 gives 1024 x 1024
+            #64, 64 gives 512 x 512
+            #32, 32 gives 256 x 256
+            #16, 16 gives 128 x 128
             steps = num_inference_steps
         )
 
