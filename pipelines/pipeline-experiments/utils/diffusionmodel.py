@@ -4,6 +4,7 @@ import torch
 import datetime
 import diffusers
 import transformers 
+import torch.nn as nn
 
 import numpy as np
 from PIL import Image
@@ -15,17 +16,15 @@ from torch.utils.tensorboard import SummaryWriter
 from safetensors.torch import load_file,save_file
 from transformers import AutoTokenizer, T5EncoderModel
 
-from .dit import DiT
-from .CaT import CrossAttentionTransformer
+from .dit import DiffusionTransformer
 from .RectifiedFlow import RectifiedFlow
 
-class DiffusionModelPipeline:
+class DiffusionModelPipeline(nn.Module):
     def __init__(self,
                  tokenizer = None,
                  text_encoder = None, 
                  vae = None, 
                  dit_params = None,
-                 cat_params = None,
                  max_length: int = 128,
                  num_train_timesteps=1000,
                  emaStrength = 0.0,
@@ -33,13 +32,15 @@ class DiffusionModelPipeline:
                  global_step = 0,
                  device='cuda'):
         
+        super(DiffusionModelPipeline, self).__init__()
+        
         self.device = torch.device(device)
         self.emaStrength = emaStrength
         
         # Initialize components
-        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained('components/t5Base')
-        self.text_encoder = text_encoder or T5EncoderModel.from_pretrained('components/t5Base').to(self.device)
-        self.vae = vae or AutoencoderKL.from_pretrained('components/flux_schnell_vae').to(self.device)
+        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained('../components/t5Base')
+        self.text_encoder = text_encoder or T5EncoderModel.from_pretrained('../components/t5Base').to(self.device)
+        self.vae = vae or AutoencoderKL.from_pretrained('../components/flux_schnell_vae').to(self.device)
         self.latent_channels = self.vae.decoder.conv_in.in_channels
         
         # Freeze text_encoder and VAE
@@ -52,30 +53,19 @@ class DiffusionModelPipeline:
         self.dit_params = {
             'channels': dit_params.get('channels', 384),
             'nBlocks': dit_params.get('nBlocks', 8),
-            'inC': dit_params.get('inC', 4),
+            'conditionC': dit_params.get('conditionC', 384),
             'nHeads': dit_params.get('nHeads', 8),
             'patchSize': dit_params.get('patchSize', 2),
         }
-        
-        self.cat_params = {
-            'input_dim': self.text_encoder.config.d_model,
-            'hidden_dim': cat_params.get('hidden_dim', 512),
-            'output_dim': cat_params.get('output_dim', 256),
-            'num_layers': cat_params.get('num_layers', 3),
-            'num_heads': cat_params.get('num_heads', 8),
-        }
-               
-        self.dit_params['conditionC'] = 1 + self.cat_params['output_dim']  # time + CaT output
-        
-        self.cat = CrossAttentionTransformer(**self.cat_params).to(self.device)
+      
         self.diffusion_model = RectifiedFlow(
-            DiT(channels=self.dit_params['channels'],
+            DiffusionTransformer(channels=self.dit_params['channels'],
                 nBlocks=self.dit_params['nBlocks'],
-                inC=self.dit_params['inC'], 
-                outC=self.latent_channels, 
+                latent_channels=self.latent_channels, 
                 conditionC=self.dit_params['conditionC'], 
                 nHeads=self.dit_params['nHeads'], 
-                patchSize=self.dit_params['patchSize']).to(self.device),
+                patchSize=self.dit_params['patchSize'],
+                text_embed_dim = self.text_encoder.config.hidden_size).to(self.device),
             num_train_timesteps,
             emaStrength= self.emaStrength,
             device = self.device)
@@ -85,6 +75,9 @@ class DiffusionModelPipeline:
         self.optimizer = optimizer
         
         self.global_step = global_step
+        
+        self.num_parameters = self.get_num_parameters()
+        self.total_parameters = sum(self.num_parameters.values())
         
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
@@ -103,7 +96,6 @@ class DiffusionModelPipeline:
             text_encoder=text_encoder,
             vae=vae,
             dit_params=config["dit_params"],
-            cat_params=config["cat_params"],
             num_train_timesteps=config["num_train_timesteps"],
             max_length=config["max_length"],
             emaStrength=config["emaStrength"],
@@ -128,11 +120,6 @@ class DiffusionModelPipeline:
             # If no EMA model saved, set emaModel to model
             model.diffusion_model.emaModel = model.diffusion_model.model
         
-        #load CaT
-        cat_load_path = os.path.join(pretrained_model_name_or_path, 'cat.safetensors')
-        cat_state_dict = load_file(cat_load_path)
-        model.cat.load_state_dict(cat_state_dict)
-        
         return model
 
     def save_pretrained(self, save_directory):
@@ -148,11 +135,6 @@ class DiffusionModelPipeline:
             ema_save_path = os.path.join(save_directory, "ema_model.safetensors")
             ema_state_dict = self.diffusion_model.emaModel.state_dict()
             save_file(ema_state_dict, ema_save_path)
-        
-        #Save the CaT
-        cat_save_path = os.path.join(save_directory, "cat.safetensors")
-        cat_state_dict = self.cat.state_dict()
-        save_file(cat_state_dict, cat_save_path)
         
         ##Save the vae
         vae_save_path = os.path.join(save_directory, "vae")
@@ -170,9 +152,10 @@ class DiffusionModelPipeline:
             "max_length": self.max_length,
             "emaStrength": self.diffusion_model.emaStrength,
             "dit_params": self.dit_params,
-            "cat_params": self.cat_params,
             "num_train_timesteps": self.diffusion_model.T,
             "time_of_save": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "num_parameters": self.num_parameters,
+            "total_parameters": sum(self.num_parameters.values())
         }
         with open(os.path.join(save_directory, "config.json"), "w") as f:
             json.dump(config, f)
@@ -181,7 +164,7 @@ class DiffusionModelPipeline:
         tokens = self.tokenizer(text, padding=True, max_length= self.max_length, truncation=True, return_tensors="pt").to(self.device)
         with torch.no_grad():
             text_embeddings = self.text_encoder(tokens.input_ids)[0]
-        return self.cat(text_embeddings)
+        return text_embeddings
 
     def encode_image(self, image):
         with torch.no_grad():
@@ -223,7 +206,7 @@ class DiffusionModelPipeline:
             noisy_latents, epsilon = self.diffusion_model.q(latents, timesteps)
             
             #pred
-            pred_noise = self.diffusion_model.p(noisy_latents, timesteps, text_embeds)
+            pred_noise = self.diffusion_model.p(noisy_latents, timesteps, condition=None, text_embed=text_embeds)
             loss = (((epsilon - latents - pred_noise) ** 2).mean(dim=(2, 3)).mean())
             
             self.optimizer.zero_grad()
@@ -266,8 +249,8 @@ class DiffusionModelPipeline:
                 text_embeds = self.encode_text(list(prompts))
 
                 timesteps = torch.rand(batch_size, 1, 1, 1).to(self.device)
-                noisy_latents, epsilon = self.diffusion_model.q(latents, timesteps)
-                pred_noise = self.diffusion_model.p(noisy_latents, timesteps, text_embeds)
+                noisy_latents, epsilon = self.diffusion_model.q(latents, timesteps)            
+                pred_noise = self.diffusion_model.p(noisy_latents, timesteps, condition=None, text_embed=text_embeds)
                 loss = (((epsilon - latents - pred_noise) ** 2).mean(dim=(2, 3)).mean())
                 val_loss += loss.item()
         
@@ -351,20 +334,18 @@ class DiffusionModelPipeline:
         logger = SummaryWriter(log_dir)
 
         if self.optimizer is None:
-            print('''changing optimizer to AdamW and added rectified flow and CaT''')
+            print('''changing optimizer to AdamW and added rectified flow ''')
             self.optimizer = torch.optim.AdamW([
-                {'params': self.diffusion_model.model.parameters()},
-                {'params': self.cat.parameters()}],
+                {'params': self.diffusion_model.model.parameters()}],
                     lr=lr,
                     betas = (0.9, 0.999),
                     weight_decay=0.1
-            )
+                )
 
         ##Training loop
         for epoch in range(epochs):
             self.diffusion_model.model.train()
             self.diffusion_model.emaModel.train()
-            self.cat.train()
             
             epoch_train_loss = self.train_step(train_dataloader, 
                                          epoch, 
@@ -376,7 +357,6 @@ class DiffusionModelPipeline:
             if val_dataloader is not None:
                 self.diffusion_model.model.eval()
                 self.diffusion_model.emaModel.eval()
-                self.cat.eval()
                 
                 epoch_val_loss = self.validation_step(val_dataloader, 
                                                        epoch, 
@@ -437,14 +417,12 @@ class DiffusionModelPipeline:
         self.device = torch.device(device)
         self.text_encoder = self.text_encoder.to(self.device)
         self.vae = self.vae.to(self.device)
-        self.cat = self.cat.to(self.device)
         self.diffusion_model = self.diffusion_model.to(self.device)
         return self
 
     def generate(self, prompt, num_inference_steps=50):
         self.vae.eval()
         self.text_encoder.eval()
-        self.cat.eval()
         self.diffusion_model.model.eval()
         
         if isinstance(prompt, str):
@@ -456,7 +434,8 @@ class DiffusionModelPipeline:
         text_embeddings = self.encode_text(prompt)
         
         latents = self.diffusion_model.call(
-            condition = text_embeddings, 
+            condition = None,# torch.tensor([self.diffusion_model.conditionC]).to(self.device), 
+            text_embed = text_embeddings,
             shape = (batch_size, self.latent_channels, 16, 16),
             #128, 128 gives 1024 x 1024
             #64, 64 gives 512 x 512
@@ -474,6 +453,22 @@ class DiffusionModelPipeline:
         
         return images
 
+    @staticmethod
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+   
+    def get_num_parameters(self):
+        
+        dit_parameters = self.count_parameters(self.diffusion_model.model)
+        emma_parameters = self.count_parameters(self.diffusion_model.emaModel) if self.diffusion_model.emaModel is not self.diffusion_model.model else 0
+        
+        num_parameters = {
+            "text_encoder": self.count_parameters(self.text_encoder),
+            "vae": self.count_parameters(self.vae),
+            "diffusion transformer": dit_parameters + emma_parameters
+        }
+        return num_parameters
+    
     def __call__(self, prompt, num_inference_steps=50):
         return self.generate(prompt, num_inference_steps)
 
@@ -495,9 +490,6 @@ class DiffusionModelPipeline:
             },
             "diffusion_model": {
                 "Rectified Flow": self.diffusion_model.__class__.__name__,
-            },
-            "cross_attention_transformer": {
-                "CrossAttentionTransformer": self.cat.__class__.__name__,
             },
             "vae": {
                 "class_name": self.vae.config._class_name,

@@ -107,37 +107,96 @@ class RoPEAttention(torch.nn.Module):
 
         return self.outProj(attnOutput)
 
+class CrossAttention(torch.nn.Module):
+    def __init__(self, dim, heads = 8):
+        super().__init__()
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+        
+        self.to_q = torch.nn.Linear(dim, dim, bias = False)
+        self.to_k = torch.nn.Linear(dim, dim, bias = False)
+        self.to_v = torch.nn.Linear(dim, dim, bias = False)
+        self.to_out = torch.nn.Linear(dim, dim, bias = False)
+        
+    def forward(self, x, context):
+        # x: (B, N, dim) latents
+        # context: (B, L, dim) text embeddings
+        B, N, C = x.shape
+        _, L, _ = context.shape
+        
+        H = self.heads
+        head_dim = C // H
+        
+        q = self.to_q(x).view(B, N, H, head_dim).transpose(1, 2)
+        k = self.to_k(context).view(B, L, H, head_dim).transpose(1, 2)
+        v = self.to_v(context).view(B, L, H, head_dim).transpose(1, 2)
+        
+        attn_scores = torch.einsum('bhqd,bhkd->bhqk', q, k) * self.scale
+        attn_probs = torch.nn.functional.softmax(attn_scores, dim = -1)
+        
+        out = torch.einsum('bhqk,bhvd->bhqd', attn_probs,v) * self.scale
+        out = out.transpose(1,2).contiguous().view(B, N, C)
+        return self.to_out(out)
+        
+
 class DiTBlock(torch.nn.Module):
-    def __init__(self,channels,heads,conditionC):
+    
+    def __init__(self,channels,heads,conditionC, text_embed_dim):
         super().__init__()
         self.norm1=AdaLN(conditionC,channels)
         self.norm2=torch.nn.GroupNorm(1,channels,eps=1e-6)
+        self.norm3=torch.nn.GroupNorm(1,channels,eps=1e-6)
         self.attn=RoPEAttention(channels,heads,8)
             
-        self.mlp=torch.nn.ModuleDict({
-            "fc1":torch.nn.Linear(channels,channels*4),
-            "fc2":torch.nn.Linear(channels*4,channels)
-        })
+        ##Cross attention layer
+        self.cross_attn = CrossAttention(channels, heads)
+        self.text_proj = torch.nn.Linear(text_embed_dim, channels)
+            
+        self.mlp=torch.nn.Sequential(
+            torch.nn.Linear(channels,channels*4),
+            torch.nn.GELU(),
+            torch.nn.Linear(channels*4,channels)
+        )
+        
         self.ls1=LayerScale(channels,init_values=0.0)
         self.ls2=LayerScale(channels,init_values=0.0)
+        self.ls3=LayerScale(channels,init_values=0.0)
 
-    def forward(self,x,condition):
+    def forward(self,x,condition, text_embed):
+        # x: (B, C, H, W)
+        # condition: (B, conditionC, 1, 1)
+        # text_embed: (B, L, text_embed_dim)
+        
+        B, C, H, W = x.shape
+        
+        #self attention        
         input=x
         x=self.norm1(x,condition)
         x=self.attn(x) 
-        x=self.ls1(x)+input
+        x=self.ls1(x) + input
 
+        #cross attention
         input=x
-        x=self.norm2(x)
-        x=x.permute(0,2,3,1)
-        x=self.mlp.fc1(x)
-        x=torch.nn.functional.gelu(x)
-        x=self.mlp.fc2(x)
-        x=x.permute(0,3,1,2)
-        x=self.ls2(x)+input
+        x=self.norm3(x)
+        x = x.view(B, C, H * W).transpose(1, 2) #(B, N, C) where N = H * W
+        
+        # Project Text Embeddings to match channel
+        text_embed_proj = self.text_proj(text_embed)
+        
+        x = self.cross_attn(x, text_embed_proj)
+        x = x.transpose(1, 2).view(B, C, H, W)
+        x = self.ls2(x) + input
+
+        #Feed forward
+        input = x
+        x = self.norm2(x)        
+        x=x.permute(0,2,3,1).reshape(B*H*W,C)
+        x=self.mlp(x)
+        x=x.view(B, H, W, C).permute(0,3,1,2)
+        x=self.ls3(x)+input
         return x
     
-class DiT(torch.nn.Module):
+class DiffusionTransformer(torch.nn.Module):
     """
     Diffusion Transformer (DiT) model.
 
@@ -149,36 +208,55 @@ class DiT(torch.nn.Module):
         channels (int): Number of channels in each transformer block.
         nBlocks (int): Number of DiT blocks in the model.
         nHeads (int): Number of attention heads
-        inC (int): Number of input channels.
-        outC (int): Number of output channels.
-        conditionC (int): Number of conditioning channels -> set to 1+text_embed_dim
+        latent_channels (int): Number of latent channels used by VAE.
+        conditionC (int): Number of conditioning channels -> need to set a sinusodial position embedding, this is the timestep embedding
         patchSize (int, optional): Size of patches for patchification. Defaults to 1. Increasing this
         will speed up training and lower VRAM requirements, at the expense of generation quality
         and potential artifacts. The final convolution layer attempts to mitigate this effect
+        
+    Training notes:
+    To match flux lets make the following adjustments:
+        - Adjust depth (nBlocks) to learn better hierarchical representations 
+            flux schnell uses 19 blocks
+        - Adjust (channels) to increase model capacity. 
+            flux schnell uses 3072 = 128*8 = (attention head dim) * (num_attention_heads)
+        - Adjust nHeads to 24
+        - Adjust conditionC to 4096 + 1
+            
     """
-    def __init__(self,channels,nBlocks,inC,outC,conditionC,nHeads=8,patchSize=2):
+    def __init__(self,
+                 channels, #hidden dimension of the transformer - increases model capacity
+                 nBlocks, #number of transformer blocks - increases model depth
+                 latent_channels, #number of input channels from VAE latent space
+                 conditionC, # Number of conditioning channels -> need to set a sinusodial position embedding, this is the timestep embedding
+                 nHeads=8, #number of attention heads - more heads to focus on different parts of input
+                 patchSize=1, # Size of patches for image embeddings
+                 text_embed_dim = 512):
         super().__init__()
-
+        self.conditionC = conditionC
+        ##Projection
         self.patchify=torch.nn.PixelUnshuffle(patchSize)
-        self.inProj=torch.nn.Conv2d(inC*patchSize**2,channels,kernel_size=1)
-        self.blocks=torch.nn.ModuleList()
-        for i in range(nBlocks):
-            self.blocks.append(DiTBlock(channels,nHeads,conditionC))
-        self.outProj=torch.nn.Conv2d(channels,outC*patchSize**2,kernel_size=1)
+        self.inProj=torch.nn.Conv2d(latent_channels * patchSize**2, channels, kernel_size=1)
+        
+        ##Transformer Blocks - now with internal self-attention and cross-attention
+        self.blocks=torch.nn.ModuleList([
+            DiTBlock(channels, nHeads, conditionC, text_embed_dim) 
+            for _ in range(nBlocks)
+        ])
+        
+        #Output Projhection
+        self.outProj=torch.nn.Conv2d(channels,latent_channels*patchSize**2,kernel_size=1)
         self.unpatchify=torch.nn.PixelShuffle(patchSize)
-        self.finalConv=torch.nn.Conv2d(outC,outC,kernel_size=3,padding='same')
+        self.finalConv=torch.nn.Conv2d(latent_channels,latent_channels,kernel_size=3,padding='same')
         
         self.condProj = torch.nn.Linear(conditionC, channels)
 
-    def forward(self,x,condition):
+    def forward(self,x,condition,text_embed):
         x = self.patchify(x)
         x = self.inProj(x)
-        # Rest of the code
-        b, c, h, w = x.shape
         
-        condition = condition.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, h, w)
         for block in self.blocks:
-            x = block(x, condition)
+            x = block(x, condition, text_embed)
         
         x = self.outProj(x)
         x = self.unpatchify(x)
