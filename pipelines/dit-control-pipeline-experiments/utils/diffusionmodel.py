@@ -583,7 +583,7 @@ class DiffusionModelPipeline(nn.Module):
             condition = None, # torch.tensor([self.diffusion_model.conditionC]).to(self.device), 
             text_embed = text_embeddings,
             shape = (batch_size, self.latent_channels, 8, 8),
-            steps = num_inference_steps
+            steps = num_inference_steps,
             control_embed = control_embeds
         )
 
