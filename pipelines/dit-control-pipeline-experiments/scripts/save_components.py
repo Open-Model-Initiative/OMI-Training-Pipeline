@@ -8,4 +8,4 @@ tokenizer.save_pretrained("../components/tokenizer/t5-base")
 text_encoder.save_pretrained("../components/text-encoder/t5-base")
 
 vae = AutoencoderKL.from_pretrained("wolfgangblack/flux_vae")
-vae.save_pretrained("../components/vae/flux_vae")
+vae.save_pretrained("../components/vae/flux_schnell_vae")

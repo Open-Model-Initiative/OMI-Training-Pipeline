@@ -16,7 +16,7 @@ class MapEncoder(nn.Module):
             nn.ReLU(inplace = True),
             nn.conv2d(64, 128, kernel_size=3, stride=2, padding=1), #H/8, W/8
             nn.ReLU(inplace = True),
-            nn.conv2d(128, embed_dim, kernel_size = 3, stride = 2, padding = 1) #H/16, w/16
+            nn.conv2d(128, embed_dim, kernel_size = 3, stride = 2, padding = 1), #H/16, w/16
             nn.ReLU(inplace = True)
         )
         
@@ -30,14 +30,13 @@ class ControlTransformer(nn.Module):
     def __init__(self, 
                  input_channels=2,  # Edge and depth maps
                  embed_dim=768, 
-                 num_layers=4, 
                  num_heads=8):
         
         super(ControlTransformer, self).__init__()
         self.embed_dim = embed_dim
         self.input_channels = input_channels
         
-        self.map_encoder = MapEncoder(input_channels = 1, embed_dim)
+        self.map_encoder = MapEncoder(1, embed_dim)
         #For now, we'll use the same map encoder for both edge and depth maps
         #In the future, we can have separate encoders for each map type if needed
         

@@ -59,7 +59,6 @@ class DiffusionModelPipeline(nn.Module):
                'embed_dim': control_embed_dim,
                 'num_layers': 4,
                 'num_heads': 8,
-                'patch_size': 1
                 }
             
         self.control_transformer = ControlTransformer(
