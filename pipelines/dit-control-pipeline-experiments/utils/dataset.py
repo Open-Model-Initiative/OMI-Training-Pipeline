@@ -23,29 +23,51 @@ class ImagePromptDataset(Dataset):
         self.device = device
         self.maps = maps
 
+        if self.maps is not None and 'depth' in self.maps:
+            model_type = "DPT_Large"
+            self.midas = torch.hub.load("intel-isl/MiDaS", model_type)
+            self.midas.eval()
+                    
+            self.midas.to(self.device)
+            self.midas_transform = torch.hub.load("intel-isl/MiDaS", "transforms").dpt_transform
+        else:
+            self.midas = None
+            self.midas_transform = None
+            
+        self.cache = {}
+            
+            
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        """
+        Get the image, prompt, and requested maps for the given index.
+        """
         sample = self.dataset[idx]
-        
         image = sample['image']
-        prompt = sample.get('text')## for testing
-        
-        mappings = self.get_maps(image) if self.maps is not None else {}
-        
-        if self.transform:
-            image = self.transform(image).to(self.device)
-            
-            if 'depth' in mappings:
-                mappings['depth'] = self.transform(mappings['depth']).to(self.device)
-            if 'edge' in mappings:
-                mappings['edge'] = self.transform(mappings['edge']).to(self.device)
+        prompt = sample.get('text', '')## for testing
         
         if self.maps is not None:
-            return image, prompt, torch.stack([i for i in list(mappings.values())]).squeeze(1)
- 
-        return image, prompt
+            if idx not in self.cache:
+                mappings = self.get_maps(image)
+                self.cache[idx] = mappings
+            else:
+                mappings = self.cache[idx]
+            
+        if self.transform:
+            image = self.transform(image).to(self.device)
+            for k,v in mappings.items():
+                map_tensor = self.transform(v).to(self.device)
+                mappings[k] = map_tensor
+                
+        if self.maps is not None:
+            map_list = [mappings[k] for k in self.maps]
+            map_tensor = torch.concat(map_list)
+            return image, prompt, map_tensor 
+        
+        else:
+            return image, prompt
     
     def get_maps(self, image):
         """
@@ -59,10 +81,11 @@ class ImagePromptDataset(Dataset):
         """
         mappings = {}
         
-        if 'depth' in self.maps:
-            mappings['depth'] = self.calc_depth(image)
-        if 'edge' in self.maps:
-            mappings['edge'] = self.calc_edge(image)
+        if self.maps is not None:
+            if 'depth' in self.maps:
+                mappings['depth'] = self.calc_depth(image)
+            if 'edge' in self.maps:
+                mappings['edge'] = self.calc_edge(image)
         
         return mappings
     
@@ -77,16 +100,9 @@ class ImagePromptDataset(Dataset):
         Returns:
             Depth map for the image.
         """
-        model_type = "DPT_Large"
-        midas = torch.hub.load("intel-isl/MiDaS", model_type)
-        midas.eval()
-                
-        midas.to(self.device)
-        transform = torch.hub.load("intel-isl/MiDaS", "transforms").dpt_transform
-        
-        input_batch = transform(np.array(image.convert("RGB"))).to(self.device)
+        input_batch = self.midas_transform(np.array(image.convert("RGB"))).to(self.device)
         with torch.no_grad():
-            depth_map = midas(input_batch)
+            depth_map = self.midas(input_batch)
         
         depth_map = (depth_map - torch.min(depth_map))/(torch.max(depth_map) - torch.min(depth_map))
         
@@ -110,8 +126,8 @@ class ImagePromptDataset(Dataset):
         image = np.array(image.convert("RGB"))
         image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         
-        edge_map = cv2.Canny(image, 100, 200)
-        
+        edge_map = cv2.Canny(image, low_threshold, 200)
+    
         edge_map = Image.fromarray(edge_map)
         
         return edge_map

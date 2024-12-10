@@ -51,7 +51,6 @@ class RectifiedFlow(torch.nn.Module):
         return xT,source
     
     def p(self,xT,t,condition=None, text_embed=None, control_embed = None):
-        
         t = t.view(-1,1)
         t = self.get_timestep_embeddings(t)
         
@@ -68,7 +67,7 @@ class RectifiedFlow(torch.nn.Module):
   
         return vPred
 
-    def call(self,steps,shape=None, text_embed = None, condition=None, loopFunction=None):
+    def call(self,steps,shape=None, text_embed = None, condition=None, loopFunction=None, control_embed = None):
         #loopFunction is a function with the same signature as vSample which returns the sample at t-1.
         #It can be used to implement CFG and schedulers
         if loopFunction is None:
@@ -77,11 +76,11 @@ class RectifiedFlow(torch.nn.Module):
         xT=torch.randn(shape).to(self.device)
         with torch.no_grad():
             for i in tqdm( range(0,steps),ascii=" ▖▘▝▗▚▞█",disable=False):
-                xT=loopFunction(i,shape,xT,steps,condition, text_embed)
+                xT=loopFunction(i,shape,xT,steps,condition, text_embed, control_embed)
             
         return xT
     
-    def train_step(self,data,condition=None,validation=None,classifier=None):
+    def train_step(self,data,condition=None,validation=None):
         t=torch.rand(data.shape[0],1,1,1).to(self.device)
         if validation is not None:
             t=torch.ones(data.shape[0],1,1,1).to(self.device)*validation
@@ -98,7 +97,7 @@ class RectifiedFlow(torch.nn.Module):
 
         return {'loss':loss.detach()}
 
-    def vSample(self,i,inputSize,xT,steps,condition, text_embed):
+    def vSample(self,i,inputSize,xT,steps,condition, text_embed, control_embed):
         #Euler sampling without CFG
         t=1-i/steps
         dT=1/steps
@@ -107,10 +106,7 @@ class RectifiedFlow(torch.nn.Module):
         t = torch.full((batch_size, 1), t, device=self.device)
         dT = torch.full((batch_size, 1, 1, 1), dT, device=self.device)
         
-        # t=torch.Tensor([t]).reshape((1,1,1,1)).repeat_interleave(inputSize[0],dim=0).to(self.device)
-        # dT=torch.Tensor([dT]).reshape((1,1,1,1)).repeat_interleave(inputSize[0],dim=0).to(self.device)
-
-        vPred=self.p(xT,t,condition=condition, text_embed=text_embed)
+        vPred=self.p(xT,t,condition=condition, text_embed=text_embed, control_embed=control_embed)
         vSample=xT-dT*vPred
         return vSample
 

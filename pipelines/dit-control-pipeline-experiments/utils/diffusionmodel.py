@@ -22,34 +22,56 @@ from .ControlTransformer import ControlTransformer
 
 class DiffusionModelPipeline(nn.Module):
     def __init__(self,
-                 tokenizer = None,
-                 text_encoder = None, 
-                 vae = None, 
-                 dit_params = None,
+                 tokenizer=None,
+                 text_encoder=None,
+                 vae=None,
+                 dit_params=None,
+                 control_transformer_params=None,
                  max_length: int = 128,
                  num_train_timesteps=1000,
-                 emaStrength = 0.0,
-                 optimizer = None,
-                 global_step = 0,
-                 control_embed_dim = 768,
-                 control_transformer_params = None,
-                 device='cuda'):
-        
+                 emaStrength=0.0,
+                 optimizer=None,
+                 global_step=0,
+                 control_embed_dim=768,
+                 device='cuda',
+                 epoch_schedule=None):
+        """
+        tokenizer : Pretrained tokenizer to encode text prompts.
+        text_encoder : Pretrained text encoder to encode text prompts.
+        vae : Pretrained VAE to encode and decode images.
+        dit_params : Dictionary of parameters for Diffusion Transformer.
+        control_transformer_params : Dictionary of parameters for Control Transformer.
+        max_length : Maximum length of text input.
+        num_train_timesteps : Number of training timesteps for diffusion model.
+        emaStrength : Strength of exponential moving average for diffusion model.
+        optimizer : Optimizer for training.
+        global_step : Global step for training.
+        control_embed_dim : Dimension of control embeddings - should be similar to text embeddings
+        device : Device to run the model on.
+        epoch_schedule: Optional dict or list that maps epochs to fraction of batch that uses control maps.
+                        For example, {0:0.0, 10:0.5, 20:1.0} means:
+                        - from epoch 0 to 9: 0% of batch uses control
+                        - from epoch 10 to 19: 50% of batch uses control
+                        - from epoch 20 onwards: 100% of batch uses control
+        If None, we always use control maps when available.
+        """
         super(DiffusionModelPipeline, self).__init__()
         
         self.device = torch.device(device)
         self.emaStrength = emaStrength
-        
+        self.max_length = max_length
+        self.global_step = global_step
+        self.epoch_schedule = epoch_schedule
+
         # Initialize components
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained('../components/t5Base')
         self.text_encoder = text_encoder or T5EncoderModel.from_pretrained('../components/t5Base').to(self.device)
         self.vae = vae or AutoencoderKL.from_pretrained('../components/flux_schnell_vae').to(self.device)
         self.latent_channels = self.vae.decoder.conv_in.in_channels
-        
+
         # Freeze text_encoder and VAE
         for param in self.text_encoder.parameters():
             param.requires_grad = False
-
         for param in self.vae.parameters():
             param.requires_grad = False
 
@@ -57,45 +79,46 @@ class DiffusionModelPipeline(nn.Module):
             control_transformer_params = {
                'input_channels': 2,
                'embed_dim': control_embed_dim,
-                'num_layers': 4,
-                'num_heads': 8,
-                }
-            
-        self.control_transformer = ControlTransformer(
-            **control_transformer_params
-            ).to(self.device)
+               'num_layers': 4,
+               'num_heads': 8,
+            }
 
+        self.control_transformer_params = control_transformer_params
+        self.control_transformer = ControlTransformer(**control_transformer_params).to(self.device)
+
+        if dit_params is None:
+            dit_params = {}
         self.dit_params = {
             'channels': dit_params.get('channels', 384),
             'nBlocks': dit_params.get('nBlocks', 8),
             'conditionC': dit_params.get('conditionC', 384),
             'nHeads': dit_params.get('nHeads', 8),
             'patchSize': dit_params.get('patchSize', 2),
-            'control_embed_dim':control_embed_dim  
+            'control_embed_dim': control_embed_dim  
         }
-      
+
         self.diffusion_model = RectifiedFlow(
-            DiffusionTransformer(channels=self.dit_params['channels'],
+            DiffusionTransformer(
+                channels=self.dit_params['channels'],
                 nBlocks=self.dit_params['nBlocks'],
                 latent_channels=self.latent_channels, 
                 conditionC=self.dit_params['conditionC'], 
                 nHeads=self.dit_params['nHeads'], 
                 patchSize=self.dit_params['patchSize'],
-                text_embed_dim = self.text_encoder.config.hidden_size,
-                control_embed_dim=self.dit_params['control_embed_dim']).to(self.device),
+                text_embed_dim=self.text_encoder.config.hidden_size,
+                control_embed_dim=self.dit_params['control_embed_dim']
+            ).to(self.device),
             num_train_timesteps,
-            emaStrength= self.emaStrength,
-            device = self.device)
-        
+            emaStrength=self.emaStrength,
+            device=self.device
+        )
+
         self._name_or_path = "./"
-        self.max_length = max_length
         self.optimizer = optimizer
-        
-        self.global_step = global_step
-        
-        self.num_parameters = self.get_num_parameters()
+
+        self.num_parameters = self.get_trainable_parameters()
         self.total_parameters = sum(self.num_parameters.values())
-        
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         # Load config
@@ -113,11 +136,17 @@ class DiffusionModelPipeline(nn.Module):
             text_encoder=text_encoder,
             vae=vae,
             dit_params=config["dit_params"],
+            con_tran_params = config["con_tran_params"],
             num_train_timesteps=config["num_train_timesteps"],
             max_length=config["max_length"],
             emaStrength=config["emaStrength"],
         )
 
+        # Load Control Transformer
+        con_tran_load_path = os.path.join(pretrained_model_name_or_path, 'control_transformer.safetensors')
+        con_tran_state_dict = load_file(con_tran_load_path)
+        model.control_transformer.load_state_dict(con_tran_state_dict)
+        
         # Load DiT model
         dit_load_path = os.path.join(pretrained_model_name_or_path, 'dit.safetensors')
         dit_state_dict = load_file(dit_load_path)
@@ -141,6 +170,11 @@ class DiffusionModelPipeline(nn.Module):
 
     def save_pretrained(self, save_directory):
         os.makedirs(save_directory, exist_ok=True)
+        
+        ##Save the Control Transformer
+        con_tran_save_path = os.path.join(save_directory, "control_transformer.safetensors")
+        con_tran_state_dict = self.control_transformer.state_dict()
+        save_file(con_tran_state_dict, con_tran_save_path)
         
         ##Save the DiT
         dit_save_path = os.path.join(save_directory, "dit.safetensors")
@@ -169,6 +203,7 @@ class DiffusionModelPipeline(nn.Module):
             "max_length": self.max_length,
             "emaStrength": self.diffusion_model.emaStrength,
             "dit_params": self.dit_params,
+            "con_tran_params": self.control_transformer_params,
             "num_train_timesteps": self.diffusion_model.T,
             "time_of_save": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "num_parameters": self.num_parameters,
@@ -195,6 +230,60 @@ class DiffusionModelPipeline(nn.Module):
             image = self.vae.decode(latents)[0]
         return image
     
+    def get_control_embed_usage_fraction(self, epoch):
+
+        if self.epoch_schedule is None:
+            return 1.0  # always use control maps if available
+        keys = sorted(self.epoch_schedule.keys())
+        fraction = 0.0
+        for k in keys:
+            if epoch >= k:
+                fraction = self.epoch_schedule[k]
+            else:
+                break
+        return fraction
+    def compute_control_embeddings_with_mask(self, text_embeds, control_maps, fraction):
+        """
+        Compute control embeddings for the entire batch, but apply a mask to zero out embeddings
+        for a fraction of samples that should not use control embeddings.
+
+        Args:
+            text_embeds: (B, L_text, text_dim) text embeddings
+            control_maps: (B, N, H, W) control maps
+            fraction (float): value between 0.0 and 1.0 indicating what fraction of 
+                            samples should use control embeddings.
+
+        Returns:
+            control_embeds: (B, N, embed_dim) control embeddings, with some samples masked out by zeros.
+        """
+        B = control_maps.size(0)
+        # Compute control embeddings for all samples
+        control_embeds = self.control_transformer(text_embeds, control_maps)  # (B, N, embed_dim)
+
+        if fraction >= 1.0:
+            # All samples use control embeddings, no mask needed
+            return control_embeds
+
+        # Number of samples that should use control embeddings
+        num_use = int(B * fraction)
+
+        if num_use == 0:
+            # No one gets control embeddings
+            # Just return a zero tensor of the same shape
+            return torch.zeros_like(control_embeds)
+
+        # Create a mask (B, 1, 1) or (B,1) that is 1 for samples that use embeddings and 0 for the rest
+        mask = torch.ones((B, 1, 1), device=control_embeds.device, dtype=control_embeds.dtype)
+        mask[num_use:] = 0
+
+        # Broadcast mask to match control_embeds shape (B, N, embed_dim)
+        # control_embeds: (B, N, embed_dim)
+        # mask: (B, 1, 1) -> (B, N, embed_dim) via broadcasting if N and embed_dim are compatible
+        # If not, just keep the mask as (B,1,1) and rely on broadcasting:
+        control_embeds = control_embeds * mask
+
+        return control_embeds
+
     def train_step(self,
                    dataloader,
                    epoch,
@@ -208,6 +297,8 @@ class DiffusionModelPipeline(nn.Module):
                             ascii=" ▖▘▝▗▚▞█", 
                             desc=f"Epoch {epoch + 1}", 
                             leave=False)
+
+        fraction = self.get_control_embed_usage_fraction(epoch)
         
         for step, batch in enumerate(progress_bar):
             
@@ -226,12 +317,13 @@ class DiffusionModelPipeline(nn.Module):
             latents = self.encode_image(images)
             text_embeds = self.encode_text(list(prompts))
             
-            #process control maps
+            # Compute control embeddings if control_maps is available
             if control_maps is not None:
-                control_embeds = self.control_transformer(control_maps)
+                control_embeds = self.compute_control_embeddings_with_mask(text_embeds, control_maps, fraction)
+                
             else:
                 control_embeds = None
-            
+                
             # Forwards
             timesteps = torch.rand(batch_size, 1, 1, 1).to(self.device)
             noisy_latents, epsilon = self.diffusion_model.q(latents, timesteps)
@@ -273,19 +365,34 @@ class DiffusionModelPipeline(nn.Module):
                             ascii=" ▖▘▝▗▚▞█",
                             desc=f"Validation Epoch {epoch + 1}",
                             leave=False)
-
+        
         with torch.no_grad():
             for _, batch in enumerate(progress_bar):
-                images, prompts = batch[1]
+                
+                if len(batch[1]) > 2:
+                    images, prompts, control_maps = batch[1]
+                    control_maps = control_maps.to(self.device)
+                else:
+                    images, prompts = batch[1]
+                    control_maps = None
+                                        
                 images = images.to(self.device)
                 batch_size = images.size(0)
-
                 latents = self.encode_image(images)
                 text_embeds = self.encode_text(list(prompts))
 
+                if control_maps is not None:
+                    control_embeds = self.control_transformer(text_embeds, control_maps)
+                else:
+                    control_embeds = None
+
                 timesteps = torch.rand(batch_size, 1, 1, 1).to(self.device)
                 noisy_latents, epsilon = self.diffusion_model.q(latents, timesteps)            
-                pred_noise = self.diffusion_model.p(noisy_latents, timesteps, condition=None, text_embed=text_embeds)
+                pred_noise = self.diffusion_model.p(noisy_latents, 
+                                                    timesteps, 
+                                                    condition=None, 
+                                                    text_embed=text_embeds,
+                                                    control_embed = control_embeds)
                 loss = (((epsilon - latents - pred_noise) ** 2).mean(dim=(2, 3)).mean())
                 val_loss += loss.item()
         
@@ -309,7 +416,8 @@ class DiffusionModelPipeline(nn.Module):
 
         with torch.no_grad():
             images = self.generate(visualize_prompt,
-                              num_inference_steps)
+                              num_inference_steps,
+                              control_maps = None)
         
         # Convert images to tensors
         image_tensor = torch.stack([transforms.ToTensor()(image) for image in images])
@@ -318,7 +426,6 @@ class DiffusionModelPipeline(nn.Module):
         if logger is not None:
             logger.add_images("Generated Images", image_tensor, global_step=self.global_step)
             
-        
         # Save images to disk
         for idx, image in enumerate(images):
             image_filename = f"prompt_{visualize_prompt[idx]}_epoch_{epoch+1}_step_{self.global_step}.png"
@@ -382,6 +489,7 @@ class DiffusionModelPipeline(nn.Module):
         for epoch in range(epochs):
             self.diffusion_model.model.train()
             self.diffusion_model.emaModel.train()
+            self.control_transformer.train()
             
             epoch_train_loss = self.train_step(train_dataloader, 
                                          epoch, 
@@ -393,14 +501,16 @@ class DiffusionModelPipeline(nn.Module):
             if val_dataloader is not None:
                 self.diffusion_model.model.eval()
                 self.diffusion_model.emaModel.eval()
+                self.control_transformer.eval()
                 
                 epoch_val_loss = self.validation_step(val_dataloader, 
                                                        epoch, 
                                                        logger)
                 
                 val_loss_history.append(epoch_val_loss)
-            
-            current_loss = epoch_train_loss
+                current_loss = epoch_val_loss
+            else:
+                current_loss = epoch_train_loss
             
             #Check for improvement
             improvement = round(best_loss - current_loss, 6)
@@ -449,19 +559,11 @@ class DiffusionModelPipeline(nn.Module):
         return {"training_loss": train_loss_history, 
                 "validation_loss": val_loss_history}
 
-    def to(self, device):
-        self.device = torch.device(device)
-        self.text_encoder = self.text_encoder.to(self.device)
-        self.vae = self.vae.to(self.device)
-        self.diffusion_model = self.diffusion_model.to(self.device)
-        self.control_transformer = self.control_transformer.to(self.device)
-
-        return self
-
-    def generate(self, prompt, num_inference_steps=50):
+    def generate(self, prompt, num_inference_steps=50, control_maps = None):
         self.vae.eval()
         self.text_encoder.eval()
         self.diffusion_model.model.eval()
+        self.control_transformer.eval()
         
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -471,20 +573,30 @@ class DiffusionModelPipeline(nn.Module):
         #encode text
         text_embeddings = self.encode_text(prompt)
         
+        if control_maps is not None:
+            # assuming control_maps: (batch_size, N, H, W)
+            control_embeds = self.control_transformer(text_embeddings, control_maps.to(self.device))
+        else:
+            control_embeds = None
+        
         latents = self.diffusion_model.call(
-            condition = None,# torch.tensor([self.diffusion_model.conditionC]).to(self.device), 
+            condition = None, # torch.tensor([self.diffusion_model.conditionC]).to(self.device), 
             text_embed = text_embeddings,
             shape = (batch_size, self.latent_channels, 8, 8),
-            #128, 128 gives 1024 x 1024
-            #64, 64 gives 512 x 512
-            #32, 32 gives 256 x 256
-            #16, 16 gives 128 x 128
             steps = num_inference_steps
+            control_embed = control_embeds
         )
+
+        ##in the code above, we can use shape to...shape the size of the gen outputs. 
+        # This must be related to the shape we're using at the begining for the image transform
+        #   128, 128 gives 1024 x 1024
+        #   64, 64 gives 512 x 512
+        #   32, 32 gives 256 x 256
+        #   16, 16 gives 128 x 128
+        #   8, 8 gives 64 x 64
 
         #Decode the image
         images = self.decode_latents(latents)
-        
         images = (images /2 + 0.5).clamp(0, 1)
         images = images.cpu().permute(0, 2, 3, 1).numpy()
         images = [Image.fromarray((image * 255).astype(np.uint8)) for image in images]
@@ -495,15 +607,17 @@ class DiffusionModelPipeline(nn.Module):
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
    
-    def get_num_parameters(self):
+    def get_trainable_parameters(self):
         
+        con_tran_parameters = self.count_parameters(self.control_transformer)
         dit_parameters = self.count_parameters(self.diffusion_model.model)
         emma_parameters = self.count_parameters(self.diffusion_model.emaModel) if self.diffusion_model.emaModel is not self.diffusion_model.model else 0
         
         num_parameters = {
             "text_encoder": self.count_parameters(self.text_encoder),
             "vae": self.count_parameters(self.vae),
-            "diffusion transformer": dit_parameters + emma_parameters
+            "diffusion transformer": dit_parameters + emma_parameters,
+            "control transformer": con_tran_parameters
         }
         return num_parameters
     
@@ -529,6 +643,9 @@ class DiffusionModelPipeline(nn.Module):
             "diffusion_model": {
                 "Rectified Flow": self.diffusion_model.__class__.__name__,
             },
+            "control_transformer": {
+                "ControlTransformer": self.control_transformer.__class__.__name__,
+            },
             "vae": {
                 "class_name": self.vae.config._class_name,
                 "name_or_path": self.vae.config._name_or_path,
@@ -537,3 +654,12 @@ class DiffusionModelPipeline(nn.Module):
         }
         
         return f"{self.__class__.__name__} ({json.dumps(data, indent = 2)})"
+    
+    def to(self, device):
+        self.device = torch.device(device)
+        self.text_encoder = self.text_encoder.to(self.device)
+        self.vae = self.vae.to(self.device)
+        self.diffusion_model = self.diffusion_model.to(self.device)
+        self.control_transformer = self.control_transformer.to(self.device)
+
+        return self
