@@ -1,0 +1,14 @@
+{
+    "train_batch_size": 64,
+    "steps_per_print": 10,
+    "pipeline": {
+      "pipeline_parallel_size": 2
+    },
+    "tensor_parallel": {
+      "tp_size": 4
+    },
+    "zero_optimization": {
+      "stage": 2
+    }
+  }
+  

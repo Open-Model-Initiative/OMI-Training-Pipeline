@@ -30,7 +30,6 @@ class MGPUDiffusionModelPipeline(nn.Module):
                  max_length: int = 128,
                  num_train_timesteps=1000,
                  emaStrength=0.0,
-                 optimizer=None,
                  global_step=0,
                  control_embed_dim=768,
                  device='cuda',
@@ -46,7 +45,6 @@ class MGPUDiffusionModelPipeline(nn.Module):
         max_length : Maximum length of text input.
         num_train_timesteps : Number of training timesteps for diffusion model.
         emaStrength : Strength of exponential moving average for diffusion model.
-        optimizer : Optimizer for training.
         global_step : Global step for training.
         control_embed_dim : Dimension of control embeddings - should be similar to text embeddings
         device : Device to run the model on.
@@ -116,7 +114,6 @@ class MGPUDiffusionModelPipeline(nn.Module):
         )
 
         self._name_or_path = "./"
-        self.optimizer = optimizer
 
         self.num_parameters = self.get_trainable_parameters()
         self.total_parameters = sum(self.num_parameters.values())
@@ -340,9 +337,10 @@ class MGPUDiffusionModelPipeline(nn.Module):
                                                 control_embed=control_embeds)
             loss = (((epsilon - latents - pred_noise) ** 2).mean(dim=(2, 3)).mean())
             
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            self.deepspeed_engine.zero_grad(set_to_none=True)
+            self.deepspeed_engine.backward(loss)
+            self.deepspeed_engine.step()
+
             if self.diffusion_model.emaModel is not self.diffusion_model.model: 
                 self.diffusion_model.emaModel.update_parameters(self.diffusion_model.model)
             
@@ -488,15 +486,6 @@ class MGPUDiffusionModelPipeline(nn.Module):
         else:
             logger = None  # Only rank 0 logs
             
-        if self.optimizer is None:
-            print('''changing optimizer to AdamW and added rectified flow ''')
-
-            self.optimizer = torch.optim.AdamW([
-                {
-                    'params': list(self.diffusion_model.model.parameters()) + list(self.control_transformer.parameters())
-                }
-            ], lr=lr, betas=(0.9, 0.999), weight_decay=0.1)
-
         ##Training loop
         for epoch in range(epochs):
             self.diffusion_model.model.train()
