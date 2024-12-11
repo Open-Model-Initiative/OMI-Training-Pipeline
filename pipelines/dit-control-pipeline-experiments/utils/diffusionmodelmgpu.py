@@ -20,7 +20,7 @@ from .dit import DiffusionTransformer
 from .RectifiedFlow import RectifiedFlow
 from .ControlTransformer import ControlTransformer
 
-class DiffusionModelPipeline(nn.Module):
+class MGPUDiffusionModelPipeline(nn.Module):
     def __init__(self,
                  tokenizer=None,
                  text_encoder=None,
@@ -36,6 +36,8 @@ class DiffusionModelPipeline(nn.Module):
                  device='cuda',
                  epoch_schedule=None):
         """
+        This class is a pipeline class designed for distributed training of a Diffusion Model with Control Transformer
+        
         tokenizer : Pretrained tokenizer to encode text prompts.
         text_encoder : Pretrained text encoder to encode text prompts.
         vae : Pretrained VAE to encode and decode images.
@@ -55,7 +57,7 @@ class DiffusionModelPipeline(nn.Module):
                         - from epoch 20 onwards: 100% of batch uses control
         If None, we always use control maps when available.
         """
-        super(DiffusionModelPipeline, self).__init__()
+        super(MGPUDiffusionModelPipeline, self).__init__()
         
         self.device = torch.device(device)
         self.emaStrength = emaStrength
@@ -290,11 +292,15 @@ class DiffusionModelPipeline(nn.Module):
 
         epoch_loss = 0        
         
-        progress_bar = tqdm(enumerate(dataloader), 
+      
+        if self.rank == 0:
+            progress_bar = tqdm(enumerate(dataloader), 
                             total=len(dataloader), 
                             ascii=" ▖▘▝▗▚▞█", 
                             desc=f"Epoch {epoch + 1}", 
                             leave=False)
+        else:
+            progress_bar = enumerate(dataloader)
 
         fraction = self.get_control_embed_usage_fraction(epoch)
         
@@ -344,10 +350,11 @@ class DiffusionModelPipeline(nn.Module):
             
             self.global_step += 1
             
-            if logger is not None and (self.global_step% log_interval == 0):
+            if (self.rank == 0) and (logger is not None) and (self.global_step% log_interval == 0):
                 logger.add_scalar('training loss:', loss.item(), self.global_step)
             
-            progress_bar.set_description(f"Epoch {epoch + 1} - Step {self.global_step} - Loss: {epoch_loss / (step + 1):.6f}")
+            if self.rank == 0:
+                progress_bar.set_description(f"Epoch {epoch + 1} - Step {self.global_step} - Loss: {epoch_loss / (step + 1):.6f}")
                 
                 
         return epoch_loss
@@ -395,8 +402,9 @@ class DiffusionModelPipeline(nn.Module):
                 val_loss += loss.item()
         
         avg_val_loss = val_loss / len(dataloader)
-        if logger is not None:
+        if (logger is not None) and (self.rank == 0):
             logger.add_scalar('validation loss:', avg_val_loss, epoch)
+        
         
         return avg_val_loss
     
@@ -412,6 +420,9 @@ class DiffusionModelPipeline(nn.Module):
         if epoch is None:
             raise ValueError("Epoch number must be provided for visualization.")
 
+        if self.rank != 0:
+            return
+        
         with torch.no_grad():
             images = self.generate(visualize_prompt,
                               num_inference_steps,
@@ -421,7 +432,7 @@ class DiffusionModelPipeline(nn.Module):
         image_tensor = torch.stack([transforms.ToTensor()(image) for image in images])
 
         # Add images to logger
-        if logger is not None:
+        if (logger is not None) and (self.rank == 0):
             logger.add_images("Generated Images", image_tensor, global_step=self.global_step)
             
         # Save images to disk
@@ -454,13 +465,14 @@ class DiffusionModelPipeline(nn.Module):
               val_dataloader = None,
               epochs: int = 1,
               lr: float = 1e-4,
-              log_interval: int = 100,
-              save_interval: int = 1,
-              output_dir: str = './checkpoints',
-              patience: int = 5,
-              visualize: bool = False, 
-              visualize_interval = 50,
-              **kwargs):
+             log_interval: int = 100,
+            save_interval: int = 1,
+            output_dir: str = './checkpoints',
+            patience: int = 5,
+            visualize: bool = False, 
+            visualize_interval=50,
+            rank=0,  # New parameter
+            **kwargs):
         
         train_loss_history = []
         val_loss_history = []
@@ -469,10 +481,13 @@ class DiffusionModelPipeline(nn.Module):
         best_loss = float('inf')
         epochs_no_improve = 0
         
-        #Save/Logging Variables
-        log_dir = os.path.join(output_dir)
-        logger = SummaryWriter(log_dir)
-
+        # Save/Logging Variables
+        if self.rank == 0:
+            log_dir = os.path.join(output_dir)
+            logger = SummaryWriter(log_dir)
+        else:
+            logger = None  # Only rank 0 logs
+            
         if self.optimizer is None:
             print('''changing optimizer to AdamW and added rectified flow ''')
 
@@ -515,10 +530,10 @@ class DiffusionModelPipeline(nn.Module):
                 best_loss = current_loss
                 epochs_no_improve = 0
             
-                best_model_dir = os.path.join(output_dir, 'best_model')
-                self.save_pretrained(best_model_dir)
-                logger.add_text("Training Info", f"Epoch {epoch + 1} - Model improved. Saving model to {best_model_dir}")
-                #Purposely not saving images here, as this should ramp down a ton in the beginning  
+                if self.rank == 0:
+                    best_model_dir = os.path.join(output_dir, 'best_model')
+                    self.save_pretrained(best_model_dir)
+                    logger.add_text("Training Info", f"Epoch {epoch + 1} - Model improved. Saving model to {best_model_dir}")
             else:
                 epochs_no_improve += 1
                 logger.add_text("Training Info", f"Epoch {epoch + 1} - Model did not improve {epochs_no_improve} times")
@@ -539,20 +554,23 @@ class DiffusionModelPipeline(nn.Module):
                 break
                         
             if (epoch + 1) % save_interval == 0:
-
-                checkpoint_dir = os.path.join(log_dir, f"epoch_{epoch + 1}")
-                self.save_pretrained(checkpoint_dir)
-                logger.add_text("Training Info", f"Epoch {epoch + 1} - Model saved to {checkpoint_dir}")
+                if self.rank == 0:
+                    checkpoint_dir = os.path.join(output_dir, f"epoch_{epoch + 1}")
+                    self.save_pretrained(checkpoint_dir)
+                    logger.add_text("Training Info", f"Epoch {epoch + 1} - Model saved to {checkpoint_dir}")
             if visualize and (epoch + 1) % visualize_interval == 0:
-                self.visualize_training(visualize_prompt = kwargs.get('visualize_prompt', ""), 
-                                        num_inference_steps = kwargs.get('num_inference_steps', 50),
-                                        epoch = epoch, 
-                                        train_loss_history = train_loss_history,
-                                        val_loss_history = val_loss_history,
-                                        logger = logger,
-                                        output_dir = output_dir)                
+                if self.rank == 0:
+                    self.visualize_training(visualize_prompt=kwargs.get('visualize_prompt', ""), 
+                                            num_inference_steps=kwargs.get('num_inference_steps', 50),
+                                            epoch=epoch, 
+                                            train_loss_history=train_loss_history,
+                                            val_loss_history=val_loss_history,
+                                            logger=logger,
+                                            output_dir=output_dir)
         
-        logger.close()
+        if self.rank == 0:
+            logger.close()
+            
         return {"training_loss": train_loss_history, 
                 "validation_loss": val_loss_history}
 
