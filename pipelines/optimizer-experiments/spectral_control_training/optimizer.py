@@ -31,7 +31,7 @@ def _power_iteration_sigma_max(weight: torch.Tensor, iters: int) -> torch.Tensor
 
     matrix = weight.float().reshape(weight.shape[0], -1)
     device = matrix.device
-    vector = torch.randn(matrix.shape[1], device=device)
+    vector = torch.arange(1, matrix.shape[1] + 1, device=device, dtype=matrix.dtype)
     vector = vector / vector.norm().clamp_min(1e-12)
 
     for _ in range(max(iters, 1)):
