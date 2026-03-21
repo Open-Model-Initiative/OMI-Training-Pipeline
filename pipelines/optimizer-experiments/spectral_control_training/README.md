@@ -14,9 +14,9 @@ In this post, we develop a unified framework—**Spectral Control Training (SCT)
 
 We begin with the fundamental problem:
 
-\[
+$$
 \min_W \mathbb{E}[L(W)]
-\]
+$$
 
 Under stochastic gradients, we can decompose training error into:
 
@@ -25,15 +25,15 @@ Under stochastic gradients, we can decompose training error into:
 
 A second-order approximation gives:
 
-\[
+$$
 \mathbb{E}[L(W_t)] \approx \|x_t\|^2 + T(t)^2 \cdot \mathrm{tr}(P^{-2}\Sigma)
-\]
+$$
 
 Where:
 
-- \(P^{-1}\): preconditioner (optimizer)
-- \(\Sigma\): gradient noise covariance
-- \(T(t)\): effective step size (we’ll call this *spectral temperature*)
+- $P^{-1}$: preconditioner (optimizer)
+- $\Sigma$: gradient noise covariance
+- $T(t)$: effective step size (we’ll call this *spectral temperature*)
 
 ---
 
@@ -41,9 +41,9 @@ Where:
 
 Balancing bias and variance leads to:
 
-\[
+$$
 T^*(t) \sim \frac{1}{\sqrt{t}} \cdot \frac{1}{1 + \sqrt{\mathrm{tr}(P^{-2}\Sigma)}}
-\]
+$$
 
 ### Key Insight
 
@@ -59,15 +59,15 @@ We now translate theory into a practical algorithm.
 
 ## Core Update Rule
 
-\[
+$$
 \Delta = -T(t) \cdot P^{-1} g
-\]
+$$
 
 Subject to:
 
-\[
+$$
 \lambda_{\max}(W) \le R(t)
-\]
+$$
 
 ---
 
@@ -136,9 +136,9 @@ noise_est = EMA(||g||^2) - ||EMA(g)||^2
 
 ## 3.3 Temperature Controller
 
-\[
+$$
 T(t) = \frac{T_0}{\sqrt{t}(1 + \text{noise})}
-\]
+$$
 
 This replaces:
 
@@ -201,9 +201,9 @@ This dramatically reduces overhead.
 
 Low-precision training introduces structured noise:
 
-\[
+$$
 \tilde{W} = W + \epsilon
-\]
+$$
 
 Where noise depends on scale.
 
@@ -213,9 +213,9 @@ Where noise depends on scale.
 
 SCT explicitly controls:
 
-\[
+$$
 T = \frac{||u||}{||W||}
-\]
+$$
 
 Which effectively stabilizes:
 
@@ -258,7 +258,7 @@ T_target = base_T / (1 + quant_noise)
 - Loss vs tokens
 - Gradient noise scale
 - Spectral radius
-- Temperature curve \(T(t)\)
+- Temperature curve $T(t)$
 
 ---
 
@@ -276,7 +276,7 @@ T_target = base_T / (1 + quant_noise)
 
 ## IC Perspective
 
-IC focuses on dependency order \(d\).
+IC focuses on dependency order $d$.
 
 SCT does not change structure, but:
 
@@ -304,10 +304,10 @@ SCT ensures:
 
 We can now unify everything:
 
-\[
+$$
 \Delta = -T(t) \cdot P^{-1} g
 \quad \text{s.t.} \quad \lambda_{\max}(W) \le R(t)
-\]
+$$
 
 ---
 
@@ -315,9 +315,9 @@ We can now unify everything:
 
 | Component | Role |
 |----------|------|
-| \(P^{-1}\) | Spectral shape (direction) |
-| \(T(t)\) | Spectral temperature (scale) |
-| \(R(t)\) | Spectral radius (stability) |
+| $P^{-1}$ | Spectral shape (direction) |
+| $T(t)$ | Spectral temperature (scale) |
+| $R(t)$ | Spectral radius (stability) |
 | Datapath | Noise realization |
 
 ---
