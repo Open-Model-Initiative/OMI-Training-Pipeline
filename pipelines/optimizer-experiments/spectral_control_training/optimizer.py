@@ -15,6 +15,13 @@ def _distributed_sum(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
+def _distributed_mean(value: torch.Tensor) -> torch.Tensor:
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        value.div_(dist.get_world_size())
+    return value
+
+
 def _global_sum(tensors: Iterable[torch.Tensor]) -> torch.Tensor:
     total = None
     for tensor in tensors:
@@ -144,11 +151,11 @@ class SpectralControlOptimizer(Optimizer):
         if not updates:
             return loss
 
-        natural_energy_sq = _global_sum(
-            grad.float().mul(update.float()) for _, grad, update, _, _ in updates
+        natural_energy_sq = _distributed_mean(
+            _global_sum(grad.float().mul(update.float()) for _, grad, update, _, _ in updates)
         ).clamp_min_(0.0)
         current_temperature = natural_energy_sq.sqrt().clamp_min(1e-12)
-        mean_noise = (
+        mean_noise = _distributed_mean(
             _global_sum(state["noise_ema"] for _, _, _, state, _ in updates) / len(updates)
         )
 
