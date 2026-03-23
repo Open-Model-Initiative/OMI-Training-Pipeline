@@ -15,10 +15,10 @@ def _distributed_sum(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-def _global_l2_norm_sq(tensors: Iterable[torch.Tensor]) -> torch.Tensor:
+def _global_sum(tensors: Iterable[torch.Tensor]) -> torch.Tensor:
     total = None
     for tensor in tensors:
-        contribution = tensor.float().pow(2).sum()
+        contribution = tensor.float().sum()
         total = contribution if total is None else total + contribution
     if total is None:
         total = torch.tensor(0.0)
@@ -44,14 +44,14 @@ def _power_iteration_sigma_max(weight: torch.Tensor, iters: int) -> torch.Tensor
 
 
 class SpectralControlOptimizer(Optimizer):
-    """Minimal PyTorch implementation of Spectral Control Training (SCT).
+    """PyTorch implementation of Spectral Control Training v2 (SCT v2).
 
-    This implementation follows the shared design verbatim:
+    The optimizer follows the SCT v2 control loop:
     1. precondition gradients,
-    2. estimate noise,
-    3. compute a temperature target,
-    4. rescale the update in closed loop,
-    5. optionally enforce a spectral constraint.
+    2. estimate gradient noise,
+    3. measure natural gradient energy sqrt(g^T P^-1 g),
+    4. scale updates to a target energy schedule,
+    5. optionally enforce a spectral radius constraint.
     """
 
     def __init__(
@@ -100,7 +100,7 @@ class SpectralControlOptimizer(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        updates: list[tuple[torch.nn.Parameter, torch.Tensor, dict, dict]] = []
+        updates: list[tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor, dict, dict]] = []
 
         for group in self.param_groups:
             beta2 = group["beta2"]
@@ -123,6 +123,7 @@ class SpectralControlOptimizer(Optimizer):
                     state["grad_ema"] = torch.zeros_like(param)
                     state["noise_ema"] = torch.zeros((), device=param.device)
                     state["temperature"] = torch.zeros((), device=param.device)
+                    state["natural_energy"] = torch.zeros((), device=param.device)
 
                 exp_avg_sq = state["exp_avg_sq"]
                 grad_ema = state["grad_ema"]
@@ -130,7 +131,7 @@ class SpectralControlOptimizer(Optimizer):
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                 grad_ema.mul_(noise_beta).add_(grad, alpha=1 - noise_beta)
 
-                preconditioned = grad / exp_avg_sq.sqrt().add_(eps)
+                preconditioned = grad / exp_avg_sq.sqrt().add(eps)
                 noise_instant = grad.float().pow(2).sum() - grad_ema.float().pow(2).sum()
                 noise_instant = noise_instant.clamp_min(0.0)
                 state["noise_ema"].mul_(noise_beta).add_(
@@ -138,33 +139,35 @@ class SpectralControlOptimizer(Optimizer):
                 )
 
                 state["step"] += 1
-                updates.append((param, preconditioned, state, group))
+                updates.append((param, grad, preconditioned, state, group))
 
         if not updates:
             return loss
 
-        weight_norm_sq = _global_l2_norm_sq(param.data for param, _, _, _ in updates)
-        update_norm_sq = _global_l2_norm_sq(update for _, update, _, _ in updates)
-        weight_norm = weight_norm_sq.sqrt().clamp_min(1e-12)
-        update_norm = update_norm_sq.sqrt().clamp_min(1e-12)
-        current_temperature = update_norm / weight_norm
+        natural_energy_sq = _global_sum(
+            grad.float().mul(update.float()) for _, grad, update, _, _ in updates
+        ).clamp_min_(0.0)
+        current_temperature = natural_energy_sq.sqrt().clamp_min(1e-12)
+        mean_noise = (
+            _global_sum(state["noise_ema"] for _, _, _, state, _ in updates) / len(updates)
+        )
 
-        mean_noise = torch.stack([state["noise_ema"] for _, _, state, _ in updates]).mean()
-
-        for param, update, state, group in updates:
+        for param, _, update, state, group in updates:
             step = state["step"]
             target_temperature = (group["T0"] / math.sqrt(step)) / (1.0 + mean_noise.item())
             temperature_scale = target_temperature / current_temperature.item()
-            scaled_update = update * temperature_scale
-            param.add_(scaled_update, alpha=-1.0)
+            param.add_(update, alpha=-temperature_scale)
             state["temperature"] = torch.tensor(target_temperature, device=param.device)
+            state["natural_energy"] = torch.tensor(
+                current_temperature.item(), device=param.device
+            )
 
         self._apply_spectral_constraint(updates)
         return loss
 
     @torch.no_grad()
     def _apply_spectral_constraint(self, updates):
-        for param, _, state, group in updates:
+        for param, _, _, state, group in updates:
             spectral_radius = group["spectral_radius"]
             if spectral_radius is None:
                 continue
@@ -174,7 +177,9 @@ class SpectralControlOptimizer(Optimizer):
             if step % period != 0:
                 continue
 
-            radius_target = spectral_radius(step) if callable(spectral_radius) else spectral_radius
+            radius_target = (
+                spectral_radius(step) if callable(spectral_radius) else spectral_radius
+            )
             sigma = _power_iteration_sigma_max(param.data, group["power_iteration_steps"])
             if sigma > radius_target:
                 param.mul_(radius_target / sigma)
