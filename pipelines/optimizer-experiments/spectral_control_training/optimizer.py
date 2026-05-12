@@ -399,7 +399,7 @@ class SpectralControlOptimizer(Optimizer):
         noise_ratio = (mean_noise / (mean_signal + eps)).item()
 
         # Apply updates
-        for param, _, update, state, group in updates:
+        for param, grad, update, state, group in updates:
             step = state["step"]
 
             # === LR-SCHEDULE COUPLING ===
