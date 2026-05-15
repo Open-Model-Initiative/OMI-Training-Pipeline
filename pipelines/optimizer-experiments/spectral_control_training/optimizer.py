@@ -354,7 +354,7 @@ class SpectralControlOptimizer(Optimizer):
                     state["operator_fidelity"] = 0.0
                     state["preconditioning_ratio"] = 0.0
                     state["temporal_drift"] = 0.0
-                    state["prev_preconditioned"] = None
+                    state["prev_preconditioned_norm"] = None
 
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
@@ -377,13 +377,12 @@ class SpectralControlOptimizer(Optimizer):
                     prec_norm_val = preconditioned.float().norm().clamp_min(eps).item()
                     state["preconditioning_ratio"] = prec_norm_val / grad_norm_val
 
-                    # Temporal consistency: drift of preconditioned gradient
-                    prev_prec = state["prev_preconditioned"]
-                    if prev_prec is not None and prev_prec.shape == preconditioned.shape:
-                        drift_num = (preconditioned.float() - prev_prec.float()).norm().item()
-                        drift_den = preconditioned.float().norm().clamp_min(eps).item()
-                        state["temporal_drift"] = drift_num / drift_den
-                    state["prev_preconditioned"] = preconditioned.detach().clone()
+                    # Temporal consistency telemetry with scalar memory footprint
+                    preconditioned_norm = preconditioned.float().norm().clamp_min(eps).item()
+                    prev_prec_norm = state["prev_preconditioned_norm"]
+                    if prev_prec_norm is not None:
+                        state["temporal_drift"] = abs(preconditioned_norm - prev_prec_norm) / preconditioned_norm
+                    state["prev_preconditioned_norm"] = preconditioned_norm
 
                     # Alpha-parameterized spectral scaling (Contra-Muon)
                     grad_norm = grad.float().norm().clamp_min(eps)
@@ -412,11 +411,11 @@ class SpectralControlOptimizer(Optimizer):
         if not updates:
             return loss
 
-        # Compute natural energy
-        natural_energy_sq = _distributed_mean(
+        # Compute natural energy: E_t = g^T P^{-1} g
+        natural_energy = _distributed_mean(
             _global_sum(grad.float().mul(update.float()) for _, grad, update, _, _ in updates)
-        ).clamp_min_(0.0)
-        current_energy = natural_energy_sq.sqrt().clamp_min(1e-12)
+        ).clamp_min_(1e-12)
+        current_energy = natural_energy
 
         # Noise ratio
         mean_noise = _distributed_mean(
