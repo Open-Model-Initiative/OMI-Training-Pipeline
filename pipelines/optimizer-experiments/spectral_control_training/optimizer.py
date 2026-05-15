@@ -73,11 +73,15 @@ def _gram_newton_schulz(
     grad_2d: torch.Tensor,
     ns_steps: int = 3,
     eps: float = 1e-8,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, float]:
     """Compute Muon-style preconditioned gradient via Gram Newton-Schulz.
 
     Computes (G^T G)^{-1/2} G via NS iteration on the Gram matrix.
     The NS iteration Q_{k+1} = (3Q - Q^3) / 2 converges to Q^{-1/2}.
+
+    Returns a tuple of (preconditioned_grad, fidelity_metric) where
+    fidelity_metric is the NS convergence ratio ||Q_k - Q_{k-1}|| / ||Q_k||
+    on the last iteration.
 
     References:
         - Dao AI Lab. Gram Newton-Schulz (2026)
@@ -90,11 +94,16 @@ def _gram_newton_schulz(
     trace = Q.trace().clamp_min(eps)
     Q = Q / (trace / cols + eps)
 
+    fidelity_metric = 0.0
     for _ in range(max(ns_steps, 1)):
+        Q_prev = Q.clone()
         Q2 = Q @ Q
         Q = (3.0 * Q - Q2 @ Q) / 2.0
+        diff_norm = (Q - Q_prev).norm().item()
+        q_norm = Q.norm().clamp_min(eps).item()
+        fidelity_metric = diff_norm / q_norm
 
-    return (G @ Q).to(grad_2d.dtype)
+    return (G @ Q).to(grad_2d.dtype), fidelity_metric
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +154,10 @@ _LAYER_BUDGET = {
 class SpectralControlOptimizer(Optimizer):
     """PyTorch implementation of Spectral Control Training v2 (SCT v2).
 
-    A geometry-consistent optimizer that controls the natural gradient energy
+    An operator approximation framework that controls the natural gradient energy
     sqrt(g^T P^{-1} g) with structured preconditioning and spectral stability.
+
+    Characterized by a 4-tuple: (Geometry, Energy, Fidelity, Cost).
 
     Key features (validated against 100+ papers from the OMI optimizer collection):
 
@@ -158,7 +169,7 @@ class SpectralControlOptimizer(Optimizer):
     3. **Row-normalization** (RMNP): continuous spectral control between periodic
        clipping events.
     4. **Nesterov momentum** (SNOO): applied AFTER preconditioning.
-    5. **Noise-adaptive scheduling**: target temperature responds to gradient SNR.
+    5. **Noise-adaptive scheduling**: target energy responds to gradient SNR.
     6. **Momentum-aware spectral clipping**: threshold accounts for effective lr
        amplification (Edge of Stability).
     7. **Adaptive spectral thresholds** (AdaMuon, Gluon): running statistics drive
@@ -175,7 +186,7 @@ class SpectralControlOptimizer(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.nn.Parameter],
-        T0: float = 1e-2,
+        E0: float = 1e-2,
         beta1: float = 0.9,
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -213,7 +224,7 @@ class SpectralControlOptimizer(Optimizer):
         """
         Args:
             params: iterable of parameters to optimize.
-            T0: base temperature (natural energy target at step 1).
+            E0: base natural energy target (natural energy target at step 1).
             beta1: EMA coefficient for first moment (gradient mean).
             beta2: EMA coefficient for second moment (Adam preconditioner).
             eps: small constant for numerical stability.
@@ -238,8 +249,8 @@ class SpectralControlOptimizer(Optimizer):
             outlier_suppression: suppress extreme weight values for quantization.
             outlier_quantile: quantile threshold for outlier suppression.
         """
-        if T0 <= 0.0:
-            raise ValueError(f"Invalid T0 value: {T0}")
+        if E0 <= 0.0:
+            raise ValueError(f"Invalid E0 value: {E0}")
         if not 0.0 <= beta1 < 1.0:
             raise ValueError(f"Invalid beta1 value: {beta1}")
         if not 0.0 <= beta2 < 1.0:
@@ -266,7 +277,7 @@ class SpectralControlOptimizer(Optimizer):
             raise ValueError(f"Invalid spectral_ema_beta value: {spectral_ema_beta}")
 
         defaults = dict(
-            T0=T0, beta1=beta1, beta2=beta2, eps=eps, noise_beta=noise_beta,
+            E0=E0, beta1=beta1, beta2=beta2, eps=eps, noise_beta=noise_beta,
             warmup_steps=warmup_steps, ns_steps=ns_steps, alpha=alpha,
             momentum=momentum, row_normalize=row_normalize,
             spectral_radius=spectral_radius, spectral_update_period=spectral_update_period,
@@ -333,12 +344,17 @@ class SpectralControlOptimizer(Optimizer):
                     state["exp_avg_sq"] = torch.zeros_like(param)
                     state["grad_ema"] = torch.zeros_like(param)
                     state["noise_ema"] = torch.zeros((), device=param.device)
-                    state["temperature"] = torch.zeros((), device=param.device)
+                    state["target_energy"] = torch.zeros((), device=param.device)
                     state["natural_energy"] = torch.zeros((), device=param.device)
                     state["velocity"] = torch.zeros_like(param)
                     state["velocity_prev"] = torch.zeros_like(param)
                     # Adaptive spectral threshold state
                     state["spectral_ema"] = torch.zeros((), device=param.device)
+                    # Operator fidelity and temporal consistency tracking
+                    state["operator_fidelity"] = 0.0
+                    state["preconditioning_ratio"] = 0.0
+                    state["temporal_drift"] = 0.0
+                    state["prev_preconditioned"] = None
 
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
@@ -351,8 +367,23 @@ class SpectralControlOptimizer(Optimizer):
                 # === STRUCTURED PRECONDITIONING (shape-dependent) ===
                 if grad.ndim >= 2:
                     G = grad.view(grad.shape[0], -1)
-                    preconditioned = _gram_newton_schulz(G, ns_steps=ns_steps, eps=eps)
+                    preconditioned, ns_fidelity = _gram_newton_schulz(G, ns_steps=ns_steps, eps=eps)
                     preconditioned = preconditioned.view(grad.shape)
+
+                    # Track operator fidelity (NS convergence ratio)
+                    state["operator_fidelity"] = ns_fidelity
+                    # Track preconditioning ratio ||Õg|| / ||g||
+                    grad_norm_val = grad.float().norm().clamp_min(eps).item()
+                    prec_norm_val = preconditioned.float().norm().clamp_min(eps).item()
+                    state["preconditioning_ratio"] = prec_norm_val / grad_norm_val
+
+                    # Temporal consistency: drift of preconditioned gradient
+                    prev_prec = state["prev_preconditioned"]
+                    if prev_prec is not None and prev_prec.shape == preconditioned.shape:
+                        drift_num = (preconditioned.float() - prev_prec.float()).norm().item()
+                        drift_den = preconditioned.float().norm().clamp_min(eps).item()
+                        state["temporal_drift"] = drift_num / drift_den
+                    state["prev_preconditioned"] = preconditioned.detach().clone()
 
                     # Alpha-parameterized spectral scaling (Contra-Muon)
                     grad_norm = grad.float().norm().clamp_min(eps)
@@ -365,6 +396,9 @@ class SpectralControlOptimizer(Optimizer):
                         preconditioned = _row_normalize(preconditioned, eps=eps)
                 else:
                     preconditioned = grad / exp_avg_sq.sqrt().add(eps)
+                    # No NS fidelity for 1D params; set defaults
+                    state["operator_fidelity"] = 0.0
+                    state["preconditioning_ratio"] = 0.0
 
                 # Noise estimation
                 grad_norm_sq = grad.float().pow(2).sum()
@@ -382,7 +416,7 @@ class SpectralControlOptimizer(Optimizer):
         natural_energy_sq = _distributed_mean(
             _global_sum(grad.float().mul(update.float()) for _, grad, update, _, _ in updates)
         ).clamp_min_(0.0)
-        current_temperature = natural_energy_sq.sqrt().clamp_min(1e-12)
+        current_energy = natural_energy_sq.sqrt().clamp_min(1e-12)
 
         # Noise ratio
         mean_noise = _distributed_mean(
@@ -423,17 +457,17 @@ class SpectralControlOptimizer(Optimizer):
                 nesterov_update = nesterov_update * mask.float()
 
             # === ENERGY CONTROL ===
-            T0_effective = group["T0"] * lr_scale
+            E0_effective = group["E0"] * lr_scale
             warmup = group["warmup_steps"]
             if warmup > 0 and step <= warmup:
-                T0_effective = T0_effective * (step / warmup)
+                E0_effective = E0_effective * (step / warmup)
 
-            target_temperature = (T0_effective / math.sqrt(step)) / (1.0 + noise_ratio)
-            temperature_scale = target_temperature / current_temperature.item()
-            param.add_(nesterov_update, alpha=-temperature_scale)
+            target_energy = (E0_effective / math.sqrt(step)) / (1.0 + noise_ratio)
+            energy_scale = target_energy / current_energy.item()
+            param.add_(nesterov_update, alpha=-energy_scale)
 
-            state["temperature"] = torch.tensor(target_temperature, device=param.device)
-            state["natural_energy"] = torch.tensor(current_temperature.item(), device=param.device)
+            state["target_energy"] = torch.tensor(target_energy, device=param.device)
+            state["natural_energy"] = torch.tensor(current_energy.item(), device=param.device)
 
         self._apply_spectral_constraint(updates)
         self._apply_outlier_suppression(updates)
