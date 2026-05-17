@@ -60,31 +60,37 @@ class PowerIterationSigmaMaxTests(unittest.TestCase):
 class GramNewtonSchulzTests(unittest.TestCase):
     def test_identity_gradient(self) -> None:
         G = torch.eye(3)
-        result = _gram_newton_schulz(G, ns_steps=5)
+        result, fidelity = _gram_newton_schulz(G, ns_steps=5)
         self.assertTrue(torch.allclose(result, G, atol=0.1))
 
     def test_diagonal_gradient(self) -> None:
         G = torch.diag(torch.tensor([4.0, 1.0, 0.5]))
-        result = _gram_newton_schulz(G, ns_steps=5)
+        result, fidelity = _gram_newton_schulz(G, ns_steps=5)
         norms = result.norm(dim=0)
         self.assertLess(norms.max() / (norms.min() + 1e-8), 2.0)
 
     def test_ns_convergence(self) -> None:
         G = torch.randn(4, 4)
-        result_3 = _gram_newton_schulz(G, ns_steps=3)
-        result_10 = _gram_newton_schulz(G, ns_steps=10)
+        result_3, fid_3 = _gram_newton_schulz(G, ns_steps=3)
+        result_10, fid_10 = _gram_newton_schulz(G, ns_steps=10)
         self.assertEqual(result_3.shape, G.shape)
         self.assertEqual(result_10.shape, G.shape)
 
     def test_preserves_shape(self) -> None:
         G = torch.randn(8, 6)
-        result = _gram_newton_schulz(G, ns_steps=3)
+        result, fidelity = _gram_newton_schulz(G, ns_steps=3)
         self.assertEqual(result.shape, G.shape)
 
     def test_non_square_gradient(self) -> None:
         G = torch.randn(5, 3)
-        result = _gram_newton_schulz(G, ns_steps=5)
+        result, fidelity = _gram_newton_schulz(G, ns_steps=5)
         self.assertEqual(result.shape, G.shape)
+
+    def test_returns_fidelity_metric(self) -> None:
+        G = torch.randn(4, 4)
+        result, fidelity = _gram_newton_schulz(G, ns_steps=3)
+        self.assertIsInstance(fidelity, float)
+        self.assertGreaterEqual(fidelity, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +124,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
     def test_step_scales_by_natural_energy(self) -> None:
         param = torch.nn.Parameter(torch.tensor([2.0]))
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.5, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.5, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
         )
         param.grad = torch.tensor([4.0])
@@ -126,63 +132,63 @@ class SpectralControlOptimizerTests(unittest.TestCase):
 
         expected_update = 0.5
         self.assertAlmostEqual(param.item(), 2.0 - expected_update, places=5)
-        self.assertAlmostEqual(optimizer.state[param]["temperature"].item(), 0.5, places=5)
+        self.assertAlmostEqual(optimizer.state[param]["target_energy"].item(), 0.5, places=5)
         self.assertAlmostEqual(optimizer.state[param]["natural_energy"].item(), math.sqrt(4.0), places=5)
 
     def test_warmup_reduces_initial_temperature(self) -> None:
         param = torch.nn.Parameter(torch.tensor([2.0]))
         optimizer = SpectralControlOptimizer(
-            [param], T0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=10, momentum=0.0, cautious=False, adaptive_momentum=False,
         )
         param.grad = torch.tensor([4.0])
         optimizer.step()
 
-        temp = optimizer.state[param]["temperature"].item()
-        self.assertLess(temp, 0.15)
-        self.assertGreater(temp, 0.0)
+        energy = optimizer.state[param]["target_energy"].item()
+        self.assertLess(energy, 0.15)
+        self.assertGreater(energy, 0.0)
 
     def test_warmup_completes_at_full_temperature(self) -> None:
         param = torch.nn.Parameter(torch.tensor([2.0]))
         optimizer = SpectralControlOptimizer(
-            [param], T0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=2, momentum=0.0, cautious=False, adaptive_momentum=False,
         )
         for _ in range(3):
             param.grad = torch.tensor([4.0])
             optimizer.step()
 
-        temp = optimizer.state[param]["temperature"].item()
+        energy = optimizer.state[param]["target_energy"].item()
         expected = 1.0 / math.sqrt(3)
-        self.assertAlmostEqual(temp, expected, places=4)
+        self.assertAlmostEqual(energy, expected, places=4)
 
     def test_noise_ratio_reduces_temperature(self) -> None:
         param = torch.nn.Parameter(torch.tensor([2.0]))
         optimizer = SpectralControlOptimizer(
-            [param], T0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.99,
+            [param], E0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.99,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
         )
         for _ in range(50):
             param.grad = torch.randn(1) * 10.0
             optimizer.step()
-        temp_noisy = optimizer.state[param]["temperature"].item()
+        energy_noisy = optimizer.state[param]["target_energy"].item()
 
         param2 = torch.nn.Parameter(torch.tensor([2.0]))
         optimizer2 = SpectralControlOptimizer(
-            [param2], T0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.99,
+            [param2], E0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.99,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
         )
         for _ in range(50):
             param2.grad = torch.tensor([1.0])
             optimizer2.step()
-        temp_clean = optimizer2.state[param2]["temperature"].item()
+        energy_clean = optimizer2.state[param2]["target_energy"].item()
 
-        self.assertGreater(temp_clean, temp_noisy)
+        self.assertGreater(energy_clean, energy_noisy)
 
     def test_2d_param_uses_gram_ns(self) -> None:
         param = torch.nn.Parameter(torch.randn(4, 4))
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, ns_steps=3, alpha=0.5,
             row_normalize=False, cautious=False, adaptive_momentum=False,
         )
@@ -197,7 +203,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
         for alpha in [0.0, 0.5, 1.0]:
             p = torch.nn.Parameter(torch.randn(4, 4))
             opt = SpectralControlOptimizer(
-                [p], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+                [p], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
                 warmup_steps=0, momentum=0.0, ns_steps=3, alpha=alpha,
                 row_normalize=False, cautious=False, adaptive_momentum=False,
             )
@@ -215,7 +221,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
     def test_row_normalization(self) -> None:
         param = torch.nn.Parameter(torch.randn(4, 8) * 10.0)
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, ns_steps=3, alpha=0.5,
             row_normalize=True, cautious=False, adaptive_momentum=False,
         )
@@ -228,7 +234,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
     def test_nesterov_momentum(self) -> None:
         param = torch.nn.Parameter(torch.tensor([2.0]))
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.5, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.5, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.9, cautious=False, adaptive_momentum=False,
         )
         param.grad = torch.tensor([4.0])
@@ -240,7 +246,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
         """Cautious updates should mask where gradient and momentum disagree."""
         param = torch.nn.Parameter(torch.tensor([1.0, -1.0]))
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.1, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.1, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=True, adaptive_momentum=False,
         )
         # Gradient has mixed signs
@@ -253,7 +259,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
     def test_cautious_disabled(self) -> None:
         param = torch.nn.Parameter(torch.tensor([1.0]))
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.1, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.1, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
         )
         param.grad = torch.tensor([1.0])
@@ -265,7 +271,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
         wide = torch.nn.Parameter(torch.randn(64, 64))
 
         opt = SpectralControlOptimizer(
-            [narrow, wide], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [narrow, wide], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.9, cautious=False, adaptive_momentum=True,
             momentum_width_scale=0.01,
         )
@@ -289,7 +295,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
         }
 
         opt = SpectralControlOptimizer(
-            [attn_param, embed_param], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [attn_param, embed_param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
             spectral_radius=1.0, spectral_update_period=1,
             spectral_damping=0.5, power_iteration_steps=10,
@@ -307,31 +313,31 @@ class SpectralControlOptimizerTests(unittest.TestCase):
         self.assertLessEqual(attn_sigma, embed_sigma + 0.5)
 
     def test_lr_schedule_coupling(self) -> None:
-        """LR schedule should affect temperature."""
+        """LR schedule should affect energy."""
         param = torch.nn.Parameter(torch.tensor([2.0]))
 
         def lr_schedule(step: int) -> float:
             return max(0.1, 1.0 - step * 0.1)
 
         optimizer = SpectralControlOptimizer(
-            [param], T0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
             lr_schedule_fn=lr_schedule,
         )
 
-        temps = []
+        energies = []
         for _ in range(5):
             param.grad = torch.tensor([1.0])
             optimizer.step()
-            temps.append(optimizer.state[param]["temperature"].item())
+            energies.append(optimizer.state[param]["target_energy"].item())
 
-        # Temperature should decrease due to LR schedule
-        self.assertGreater(temps[0], temps[-1])
+        # Energy should decrease due to LR schedule
+        self.assertGreater(energies[0], energies[-1])
 
     def test_spectral_constraint_soft_clip(self) -> None:
         param = torch.nn.Parameter(torch.randn(4, 4) * 10.0)
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
             spectral_radius=1.0, spectral_update_period=1,
             spectral_damping=0.5, power_iteration_steps=10, adaptive_spectral=False,
@@ -349,7 +355,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
     def test_momentum_aware_threshold(self) -> None:
         param1 = torch.nn.Parameter(torch.randn(4, 4) * 10.0)
         opt1 = SpectralControlOptimizer(
-            [param1], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param1], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.99, cautious=False, adaptive_momentum=False,
             spectral_radius=5.0, spectral_update_period=1,
             spectral_damping=0.5, power_iteration_steps=10, adaptive_spectral=False,
@@ -357,7 +363,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
 
         param2 = torch.nn.Parameter(torch.randn(4, 4) * 10.0)
         opt2 = SpectralControlOptimizer(
-            [param2], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param2], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
             spectral_radius=5.0, spectral_update_period=1,
             spectral_damping=0.5, power_iteration_steps=10, adaptive_spectral=False,
@@ -381,7 +387,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
             return max(5.0, 10.0 - step * 0.1)
 
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
             spectral_radius=radius_schedule, spectral_update_period=1,
             spectral_damping=0.5, power_iteration_steps=10, adaptive_spectral=False,
@@ -397,7 +403,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
     def test_spectral_constraint_none_disables(self) -> None:
         param = torch.nn.Parameter(torch.randn(4, 4) * 10.0)
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
             spectral_radius=None, spectral_update_period=1,
         )
@@ -412,7 +418,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
     def test_spectral_constraint_skips_1d_params(self) -> None:
         param = torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
             spectral_radius=1.0, spectral_update_period=1,
         )
@@ -427,7 +433,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
         param.data[1, 1] = -100.0
 
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
             outlier_suppression=True, outlier_quantile=0.99,
             spectral_update_period=1,
@@ -446,7 +452,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
         param.data[0, 0] = 100.0
 
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
             outlier_suppression=False,
         )
@@ -461,7 +467,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
     def test_step_averages_replicated_distributed_statistics(self) -> None:
         param = torch.nn.Parameter(torch.tensor([2.0]))
         optimizer = SpectralControlOptimizer(
-            [param], T0=0.5, beta1=0.0, beta2=0.0, noise_beta=0.5,
+            [param], E0=0.5, beta1=0.0, beta2=0.0, noise_beta=0.5,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
         )
         param.grad = torch.tensor([4.0])
@@ -479,14 +485,14 @@ class SpectralControlOptimizerTests(unittest.TestCase):
         ):
             optimizer.step()
 
-        self.assertIsNotNone(optimizer.state[param]["temperature"])
+        self.assertIsNotNone(optimizer.state[param]["target_energy"])
         self.assertIsNotNone(optimizer.state[param]["natural_energy"])
 
     def test_validation_errors(self) -> None:
         param = torch.nn.Parameter(torch.tensor([1.0]))
 
         with self.assertRaises(ValueError):
-            SpectralControlOptimizer([param], T0=-1.0)
+            SpectralControlOptimizer([param], E0=-1.0)
         with self.assertRaises(ValueError):
             SpectralControlOptimizer([param], beta1=1.5)
         with self.assertRaises(ValueError):
@@ -549,7 +555,7 @@ class SpectralControlOptimizerTests(unittest.TestCase):
         p1 = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
         p2 = torch.nn.Parameter(torch.tensor([3.0, 4.0]))
         optimizer = SpectralControlOptimizer(
-            [p1, p2], T0=0.1, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [p1, p2], E0=0.1, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
         )
         p1.grad = torch.tensor([1.0, 1.0])
@@ -566,24 +572,24 @@ class SpectralControlOptimizerTests(unittest.TestCase):
     def test_temperature_decays_over_time(self) -> None:
         param = torch.nn.Parameter(torch.tensor([1.0]))
         optimizer = SpectralControlOptimizer(
-            [param], T0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [param], E0=1.0, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
         )
 
-        temps = []
+        energies = []
         for _ in range(20):
             param.grad = torch.tensor([1.0])
             optimizer.step()
-            temps.append(optimizer.state[param]["temperature"].item())
+            energies.append(optimizer.state[param]["target_energy"].item())
 
-        self.assertGreater(temps[0], temps[-1])
-        self.assertAlmostEqual(temps[0] / temps[9], math.sqrt(10), delta=1.0)
+        self.assertGreater(energies[0], energies[-1])
+        self.assertAlmostEqual(energies[0] / energies[9], math.sqrt(10), delta=1.0)
 
     def test_mixed_1d_and_2d_params(self) -> None:
         bias = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
         weight = torch.nn.Parameter(torch.randn(4, 3))
         optimizer = SpectralControlOptimizer(
-            [bias, weight], T0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            [bias, weight], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
             warmup_steps=0, momentum=0.0, ns_steps=3, alpha=0.5,
             row_normalize=True, cautious=False, adaptive_momentum=False,
         )
@@ -598,6 +604,80 @@ class SpectralControlOptimizerTests(unittest.TestCase):
 
         self.assertFalse(torch.equal(bias.data, b_before))
         self.assertFalse(torch.equal(weight.data, w_before))
+
+    # -----------------------------------------------------------------------
+    # New tests: Operator fidelity tracking
+    # -----------------------------------------------------------------------
+
+    def test_operator_fidelity_tracking(self) -> None:
+        """Verify that fidelity metrics are populated after a step on 2D params."""
+        param = torch.nn.Parameter(torch.randn(4, 4))
+        optimizer = SpectralControlOptimizer(
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            warmup_steps=0, momentum=0.0, ns_steps=3, alpha=0.5,
+            row_normalize=False, cautious=False, adaptive_momentum=False,
+        )
+        param.grad = torch.randn(4, 4)
+        optimizer.step()
+
+        state = optimizer.state[param]
+        # operator_fidelity should be a positive float (NS convergence ratio)
+        self.assertIsInstance(state["operator_fidelity"], float)
+        self.assertGreaterEqual(state["operator_fidelity"], 0.0)
+        # preconditioning_ratio should be positive
+        self.assertIsInstance(state["preconditioning_ratio"], float)
+        self.assertGreater(state["preconditioning_ratio"], 0.0)
+
+    def test_temporal_drift_tracking(self) -> None:
+        """Verify that temporal_drift is computed across steps."""
+        param = torch.nn.Parameter(torch.randn(4, 4))
+        optimizer = SpectralControlOptimizer(
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            warmup_steps=0, momentum=0.0, ns_steps=3, alpha=0.5,
+            row_normalize=False, cautious=False, adaptive_momentum=False,
+        )
+
+        # First step: temporal_drift should remain 0 (no previous preconditioned)
+        param.grad = torch.randn(4, 4)
+        optimizer.step()
+        self.assertEqual(optimizer.state[param]["temporal_drift"], 0.0)
+
+        # Second step: temporal_drift should be > 0 (gradient changes)
+        param.grad = torch.randn(4, 4)
+        optimizer.step()
+        self.assertGreater(optimizer.state[param]["temporal_drift"], 0.0)
+
+    def test_fidelity_metrics_populated_for_2d_params(self) -> None:
+        """Verify NS convergence ratio and preconditioning ratio are stored for 2D params."""
+        param = torch.nn.Parameter(torch.randn(8, 6))
+        optimizer = SpectralControlOptimizer(
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            warmup_steps=0, momentum=0.0, ns_steps=5, alpha=0.5,
+            row_normalize=False, cautious=False, adaptive_momentum=False,
+        )
+        param.grad = torch.randn(8, 6)
+        optimizer.step()
+
+        state = optimizer.state[param]
+        # With 5 NS steps, convergence ratio should be small (well-converged)
+        self.assertLess(state["operator_fidelity"], 1.0)
+        # Preconditioning ratio should be finite and positive
+        self.assertGreater(state["preconditioning_ratio"], 0.0)
+        self.assertLess(state["preconditioning_ratio"], 100.0)
+
+    def test_fidelity_defaults_for_1d_params(self) -> None:
+        """1D params should have default fidelity values (0.0)."""
+        param = torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
+        optimizer = SpectralControlOptimizer(
+            [param], E0=0.01, beta1=0.0, beta2=0.0, noise_beta=0.0,
+            warmup_steps=0, momentum=0.0, cautious=False, adaptive_momentum=False,
+        )
+        param.grad = torch.tensor([1.0, 1.0, 1.0])
+        optimizer.step()
+
+        state = optimizer.state[param]
+        self.assertEqual(state["operator_fidelity"], 0.0)
+        self.assertEqual(state["preconditioning_ratio"], 0.0)
 
 
 if __name__ == "__main__":
